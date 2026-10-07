@@ -1,0 +1,1184 @@
+/**
+ * 冒烟测试：不依赖外部网络，验证核心链路。
+ * 直接调用模块，避免端口冲突。
+ */
+import assert from 'node:assert';
+import fs from 'node:fs';
+import path from 'node:path';
+
+// 用独立的测试数据库，避免污染开发数据
+const TMP = path.resolve(process.cwd(), 'test', '.tmp');
+fs.rmSync(TMP, { recursive: true, force: true });
+fs.mkdirSync(TMP, { recursive: true });
+process.env.DB_FILE = path.join(TMP, 'test.db');
+process.env.MASTER_KEY_FILE = path.join(TMP, 'master.key');
+process.env.ADMIN_TOKEN_FILE = path.join(TMP, 'admin_token');
+process.env.DATA_DIR = TMP;
+process.env.LOG_LEVEL = 'error';
+
+const { getDb, closeDb } = await import('../src/db/index.mjs');
+const keys = await import('../src/db/keys.mjs');
+const aliases = await import('../src/db/aliases.mjs');
+const catalog = await import('../src/db/catalog.mjs');
+const channels = await import('../src/db/channels.mjs');
+const sched = await import('../src/scheduler/index.mjs');
+const rate = await import('../src/scheduler/rate.mjs');
+const config = (await import('../src/config.mjs')).default;
+const state = await import('../src/db/state.mjs');
+const firstbyte = await import('../src/adapters/firstbyte.mjs');
+const { recordFailure } = await import('../src/db/state.mjs');
+const tokens = await import('../src/db/tokens.mjs');
+const { encryptSecret, decryptSecret, fingerprint } = await import('../src/util/crypto.mjs');
+const { selectSmoothWRR } = await import('../src/scheduler/index.mjs');
+const sensenova = (await import('../src/adapters/sensenova.mjs')).default;
+const intern = (await import('../src/adapters/intern.mjs')).default;
+const { ErrClass, RETRYABLE, FATAL_FOR_REQUEST, FATAL_FOR_CHANNEL } = await import('../src/util/errors.mjs');
+
+let pass = 0;
+let fail = 0;
+function t(name, fn) {
+  try {
+    fn();
+    console.log(`  ✓ ${name}`);
+    pass++;
+  } catch (e) {
+    console.log(`  ✗ ${name}\n      ${e.message}`);
+    fail++;
+  }
+}
+async function ta(name, fn) {
+  try {
+    await fn();
+    console.log(`  ✓ ${name}`);
+    pass++;
+  } catch (e) {
+    console.log(`  ✗ ${name}\n      ${e.message}`);
+    fail++;
+  }
+}
+
+console.log('\n=== api2api 冒烟测试 ===\n');
+getDb();
+
+console.log('[1] 内置渠道');
+t('预置了三个渠道', () => {
+  const list = channels.listChannels();
+  assert.strictEqual(list.length, 3, `期望 3 个，实际 ${list.length}`);
+  const names = list.map((c) => c.name).sort();
+  assert.deepStrictEqual(names, ['intern', 'openrouter', 'sensenova']);
+});
+t('渠道 base_url 正确', () => {
+  const s = channels.getChannel('sensenova');
+  assert.strictEqual(s.base_url, 'https://token.sensenova.cn/v1');
+  const i = channels.getChannel('intern');
+  assert.strictEqual(i.base_url, 'https://discovery-api.intern-ai.org.cn/v1');
+});
+
+console.log('\n[2] 加密与指纹');
+t('AES-GCM 往返一致', () => {
+  const plain = 'sk-test-abcdef123456';
+  const enc = encryptSecret(plain);
+  assert.ok(Buffer.isBuffer(enc));
+  assert.ok(!enc.toString('utf8').includes(plain), '密文不应包含明文');
+  assert.strictEqual(decryptSecret(enc), plain);
+});
+t('同一密钥指纹稳定、不同密钥不同', () => {
+  assert.strictEqual(fingerprint('k1'), fingerprint('k1'));
+  assert.notStrictEqual(fingerprint('k1'), fingerprint('k2'));
+});
+
+console.log('\n[3] Key CRUD（uuid 主键 + 判重）');
+t('加 Key 成功', () => {
+  const rec = keys.addKey({ channel: 'sensenova', key: 'sk-sn-001', uuid: 'u-001', name: '小号1' });
+  assert.strictEqual(rec.uuid, 'u-001');
+  assert.strictEqual(rec.name, '小号1');
+  assert.strictEqual(rec.channel_name, 'sensenova');
+});
+t('uuid 重复被拒', () => {
+  assert.throws(() => keys.addKey({ channel: 'intern', key: 'sk-other', uuid: 'u-001' }), /uuid 已存在/);
+});
+t('同渠道内相同 Key 被拒（指纹判重）', () => {
+  assert.throws(() => keys.addKey({ channel: 'sensenova', key: 'sk-sn-001', uuid: 'u-002' }), /相同 Key 已存在/);
+});
+t('不同渠道可用相同 Key', () => {
+  const rec = keys.addKey({ channel: 'intern', key: 'sk-sn-001', uuid: 'u-003' });
+  assert.strictEqual(rec.uuid, 'u-003');
+});
+t('name 可空', () => {
+  const rec = keys.addKey({ channel: 'intern', key: 'sk-noname', uuid: 'u-004' });
+  assert.strictEqual(rec.name, null);
+});
+t('列表不返回明文', () => {
+  const list = keys.listKeys();
+  const s = JSON.stringify(list);
+  assert.ok(!s.includes('sk-sn-001'), '列表不应包含明文密钥');
+  assert.ok(!s.includes('secret_enc'));
+});
+t('明文可通过内部接口取回', () => {
+  assert.strictEqual(keys.getKeySecret('u-001'), 'sk-sn-001');
+});
+t('可改 name/weight/enabled', () => {
+  const rec = keys.patchKey('u-001', { name: '改名了', weight: 5, enabled: false });
+  assert.strictEqual(rec.name, '改名了');
+  assert.strictEqual(rec.weight, 5);
+  assert.strictEqual(rec.enabled, 0);
+  keys.patchKey('u-001', { enabled: true, weight: 1 });
+});
+t('删除 Key', () => {
+  assert.strictEqual(keys.deleteKey('u-004'), true);
+  assert.strictEqual(keys.getKey('u-004'), null);
+});
+t('批量导入部分成功', () => {
+  const r = keys.addKeysBulk('sensenova', [
+    { key: 'sk-bulk-1', uuid: 'ub-1' },
+    { key: 'sk-bulk-2', uuid: 'ub-2' },
+    { key: 'sk-sn-001', uuid: 'ub-dup' }, // 与已有重复
+  ]);
+  assert.strictEqual(r.total, 3);
+  assert.strictEqual(r.okCount, 2);
+  assert.strictEqual(r.failCount, 1);
+});
+
+console.log('\n[4] 模型映射');
+t('建渠道专属映射', () => {
+  const a = aliases.addAlias({ public_name: 'gpt-4o', upstream_name: 'SenseChat-5-0903', channel: 'sensenova' });
+  assert.strictEqual(a.public_name, 'gpt-4o');
+});
+t('建全局映射', () => {
+  const a = aliases.addAlias({ public_name: 'deepseek-v4', upstream_name: 'deepseek-v4-flash' });
+  assert.strictEqual(a.channel_id, null);
+});
+t('同名同渠道重复被拒', () => {
+  assert.throws(() => aliases.addAlias({ public_name: 'gpt-4o', upstream_name: 'xxx', channel: 'sensenova' }), /映射已存在/);
+});
+t('别名解析：渠道专属映射排第一，其他渠道仍同名直通（映射是叠加层）', () => {
+  const c = aliases.resolveCandidates('gpt-4o');
+  // 商汤有专属映射 → 用映射的上游名，排第一
+  assert.strictEqual(c[0].channelName, 'sensenova');
+  assert.strictEqual(c[0].upstreamName, 'SenseChat-5-0903');
+  // 书生没配映射 → 同名直通 gpt-4o（不因为"别处有映射"就被砍掉）
+  const it = c.find((x) => x.channelName === 'intern');
+  assert.ok(it, '书生渠道不应因商汤有映射而消失');
+  assert.strictEqual(it.upstreamName, 'gpt-4o');
+  // 返回所有启用渠道（不写死总数，渠道数会随接入增长）
+  assert.strictEqual(c.length, channels.listChannels().filter((x) => x.enabled).length);
+});
+t('别名解析：全局映射落到所有渠道', () => {
+  const c = aliases.resolveCandidates('deepseek-v4');
+  const enabled = channels.listChannels().filter((x) => x.enabled).length;
+  assert.strictEqual(c.length, enabled, `应落到全部 ${enabled} 个启用渠道`);
+  const others = c.filter((x) => x.upstreamName === 'deepseek-v4-flash');
+  assert.strictEqual(others.length, enabled);
+});
+t('别名解析：无映射则同名直通', () => {
+  const c = aliases.resolveCandidates('完全没配过的模型');
+  assert.strictEqual(c.length, channels.listChannels().filter((x) => x.enabled).length);
+  assert.ok(c.every((x) => x.upstreamName === '完全没配过的模型'));
+});
+t('对外模型清单', () => {
+  const m = aliases.publicModelList();
+  const ids = m.map((x) => x.id).sort();
+  assert.deepStrictEqual(ids, ['deepseek-v4', 'gpt-4o']);
+});
+
+console.log('\n[4b] 上游模型目录（下游模型列表的真相来源）');
+t('拉取落库后，上游原名直接出现在下游清单（无需建映射）', () => {
+  const ch = channels.getChannel('intern');
+  catalog.replaceChannelModels(ch.id, ['glm-5.3', 'minimax-m3', 'intern-s2']);
+  const ids = aliases.publicModelList().map((x) => x.id).sort();
+  assert.ok(ids.includes('glm-5.3'), `下游应能看到 glm-5.3，实际: ${ids.join(',')}`);
+  assert.ok(ids.includes('minimax-m3'), '下游应能看到 minimax-m3');
+  // 已有的映射仍在
+  assert.ok(ids.includes('gpt-4o'), '映射的对外名应保留');
+  assert.ok(ids.includes('deepseek-v4'), '全局映射的对外名应保留');
+});
+
+t('上游名被全局映射占用时，原名折叠只留对外名', () => {
+  const ch = channels.getChannel('intern');
+  // deepseek-v4 是全局映射 → deepseek-v4-flash；把上游名也放进目录
+  catalog.replaceChannelModels(ch.id, ['glm-5.3', 'deepseek-v4-flash']);
+  const ids = aliases.publicModelList().map((x) => x.id);
+  assert.ok(ids.includes('deepseek-v4'), '对外名应在');
+  assert.ok(!ids.includes('deepseek-v4-flash'), `上游原名应被折叠，实际: ${ids.join(',')}`);
+});
+
+t('渠道专属映射只折叠该渠道的原名，其他渠道不受影响', () => {
+  const sn = channels.getChannel('sensenova');
+  const it = channels.getChannel('intern');
+  // gpt-4o @sensenova → SenseChat-5-0903
+  catalog.replaceChannelModels(sn.id, ['SenseChat-5-0903']);
+  catalog.replaceChannelModels(it.id, ['SenseChat-5-0903']);
+  const list = aliases.publicModelList();
+  const entry = list.find((x) => x.id === 'SenseChat-5-0903');
+  assert.ok(entry, '书生渠道上未被映射占用的原名应仍可见');
+  assert.deepStrictEqual(entry.channels, ['书生·墨点'], `只应剩书生，实际 ${JSON.stringify(entry.channels)}`);
+});
+
+t('目录统计与清空', () => {
+  const stats = catalog.catalogStats();
+  assert.ok(stats.length >= 2, '应有各渠道统计');
+  const n = catalog.clearChannelModels('intern');
+  assert.ok(n > 0, '清空应删除记录');
+  assert.strictEqual(catalog.listChannelModels('intern').length, 0);
+  const ids = aliases.publicModelList().map((x) => x.id);
+  assert.ok(!ids.includes('glm-5.3'), '清空后下游不应再看到该渠道模型');
+});
+
+t('同名直通时，目录里有该模型的渠道排前面', () => {
+  catalog.replaceChannelModels(channels.getChannel('intern').id, ['only-on-intern']);
+  const c = aliases.resolveCandidates('only-on-intern');
+  const enabled = channels.listChannels().filter((x) => x.enabled).length;
+  assert.strictEqual(c.length, enabled, '所有启用渠道都会被尝试（目录只影响顺序，不剔除）');
+  assert.strictEqual(c[0].channelName, 'intern', `目录命中的渠道应排第一，实际 ${c[0].channelName}`);
+});
+
+console.log('\n[5] 调度器');
+t('优先级桶：高优先级优先', () => {
+  const { getDb: g } = { getDb };
+  keys.addKey({ channel: 'sensenova', key: 'sk-pri-hi', uuid: 'u-pri-hi', priority: 10 });
+  keys.addKey({ channel: 'sensenova', key: 'sk-pri-lo', uuid: 'u-pri-lo', priority: 0 });
+  const got = new Set();
+  for (let i = 0; i < 10; i++) {
+    const k = sched.pickKey(channels.getChannel('sensenova').id, 'm1');
+    if (k) got.add(k.uuid);
+  }
+  assert.ok(got.has('u-pri-hi'), '应选中高优先级 Key');
+  assert.ok(!got.has('u-pri-lo'), '低优先级不应被选中');
+});
+t('smooth-WRR 分布平滑且符合权重', () => {
+  const k = [
+    { uuid: 'a', priority: 1, weight: 5, currentWeight: 0 },
+    { uuid: 'b', priority: 1, weight: 1, currentWeight: 0 },
+  ];
+  const counts = { a: 0, b: 0 };
+  for (let i = 0; i < 12; i++) {
+    const { picked, updates } = selectSmoothWRR(k);
+    for (const u of updates) {
+      const tgt = k.find((x) => x.uuid === u.uuid);
+      tgt.currentWeight = u.cw;
+    }
+    counts[picked.uuid]++;
+  }
+  assert.ok(counts.a > counts.b, `权重 5 应多于权重 1（a=${counts.a} b=${counts.b}）`);
+  assert.strictEqual(counts.a, 10, `12 次中按 5:1 应为 10 次，实际 ${counts.a}`);
+});
+t('冷却中的 Key 被跳过', () => {
+  const ch = channels.getChannel('sensenova').id;
+  recordFailure('u-pri-hi', 'm-cd', { action: 'cooldown', nextRetryAt: Date.now() + 60_000 });
+  keys.addKey({ channel: 'sensenova', key: 'sk-cd-x', uuid: 'u-cd-x', priority: 10 });
+  const k = sched.pickKey(ch, 'm-cd');
+  assert.ok(k.uuid !== 'u-pri-hi', '冷却中的 Key 不应被选中');
+});
+t('错误分类决策：request_fault 不换 Key', () => {
+  const act = sched.decideAction('x', 'm', ErrClass.REQUEST_FAULT, 0);
+  assert.strictEqual(act.retry, false);
+  assert.strictEqual(act.action, 'none');
+});
+t('错误分类决策：quota 换 Key 并冷却', () => {
+  const act = sched.decideAction('x', 'm', ErrClass.QUOTA, 0);
+  assert.strictEqual(act.retry, true);
+  assert.strictEqual(act.action, 'cooldown');
+  assert.ok(act.nextRetryAt > Date.now());
+});
+t('错误分类决策：auth 连败达阈值则停用', () => {
+  // 用户要求：第 10 次连续失败才禁用
+  const before = sched.decideAction('x', 'm', ErrClass.AUTH, 8);
+  assert.strictEqual(before.action, 'cooldown', '第 9 次失败仍应冷却');
+  const act = sched.decideAction('x', 'm', ErrClass.AUTH, 9);
+  assert.strictEqual(act.action, 'disable', '第 10 次连续失败应禁用');
+  assert.strictEqual(act.streak, 10);
+});
+t('线性冷却：10min × 连续失败次数，第 10 次禁用', () => {
+  const min = 60_000;
+  assert.strictEqual(sched.cooldownFor(1), 10 * min);
+  assert.strictEqual(sched.cooldownFor(2), 20 * min);
+  assert.strictEqual(sched.cooldownFor(3), 30 * min);
+  assert.strictEqual(sched.cooldownFor(9), 90 * min);
+  // 第 10 次不再冷却，直接禁用
+  const act = sched.decideAction('x', 'm', ErrClass.QUOTA, 9);
+  assert.strictEqual(act.action, 'disable');
+  assert.strictEqual(act.cooldownMs, 0);
+});
+t('成功一次即清零连续失败（恢复健康）', () => {
+  const ch = channels.getChannel('sensenova').id;
+  keys.addKey({ channel: 'sensenova', key: 'sk-hx', uuid: 'u-hx', priority: 0 });
+  // 连失败 3 次
+  state.recordFailure('u-hx', 'm-hx', { action: 'cooldown', nextRetryAt: Date.now() + 1000, streak: 3, error: 'x' });
+  assert.strictEqual(state.getState('u-hx', 'm-hx').fail_streak, 3);
+  // 成功一次
+  state.recordSuccess('u-hx', 'm-hx');
+  const st = state.getState('u-hx', 'm-hx');
+  assert.strictEqual(st.fail_streak, 0, '成功后连续失败计数应清零');
+  assert.strictEqual(st.state, 'READY');
+  assert.strictEqual(st.next_retry_at, null);
+  void ch;
+});
+t('禁用 24 小时后自动恢复，且清零连续失败', () => {
+  keys.addKey({ channel: 'sensenova', key: 'sk-dz', uuid: 'u-dz', priority: 0 });
+  state.recordFailure('u-dz', 'm-dz', { action: 'disable', streak: 10, error: '爆了' });
+  const st1 = state.getState('u-dz', 'm-dz');
+  assert.strictEqual(st1.state, 'DISABLED');
+  assert.ok(st1.disabled_until > Date.now() + 23 * 3600_000, '应约 24 小时后恢复');
+  // 未到期：不恢复
+  state.reviveExpired(Date.now());
+  assert.strictEqual(state.getState('u-dz', 'm-dz').state, 'DISABLED', '未到期不应恢复');
+  // 到期后：恢复并清零
+  state.reviveExpired(st1.disabled_until + 1);
+  const st2 = state.getState('u-dz', 'm-dz');
+  assert.strictEqual(st2.state, 'READY');
+  assert.strictEqual(st2.fail_streak, 0, '恢复后连续失败必须清零，否则下次失败立刻又禁用');
+});
+
+/**
+ * 这条测试锁住一个**很容易误判**的语义。
+ *
+ * 曾有人（我）在线上连发 11 次请求，发现 streak 一直停在 1，以为递增坏了 ——
+ * 其实不是：第 1 次失败后 Key 立刻进冷却，**后续请求根本不会碰它**，
+ * streak 自然冻结。要走完 10 次必须**跨 10 个冷却周期**（每次到期后再失败一次）。
+ *
+ * 所以这里用「时间快进」的方式模拟：每次失败 → 把时钟推到冷却到期 → 再失败。
+ */
+t('冷却到期后再次失败 → streak 递增（不是连续请求就能涨）', () => {
+  const uuid = 'u-inc';
+  keys.addKey({ channel: 'sensenova', key: 'sk-inc', uuid, priority: 0 });
+  const model = 'm-inc';
+  const expectedMin = [10, 20, 30, 40, 50, 60, 70, 80, 90];
+
+  for (let i = 1; i <= 9; i++) {
+    const prev = state.getState(uuid, model);
+    const act = sched.decideAction(uuid, model, ErrClass.AUTH, prev.fail_streak);
+    assert.strictEqual(act.streak, i, `第 ${i} 次失败的 streak 应为 ${i}`);
+    assert.strictEqual(act.action, 'cooldown');
+    assert.strictEqual(act.cooldownMs, expectedMin[i - 1] * 60_000,
+      `第 ${i} 次冷却应为 ${expectedMin[i - 1]} 分钟，实际 ${act.cooldownMs / 60_000}`);
+    state.recordFailure(uuid, model, {
+      action: act.action, nextRetryAt: act.nextRetryAt, streak: act.streak, error: 'e',
+    });
+    // 时间快进：把冷却推到过期 → 下一次 pickKey 时才可能再选中它
+    const cur = state.getState(uuid, model);
+    state.reviveExpired(cur.next_retry_at + 1);
+    assert.strictEqual(state.getState(uuid, model).state, 'READY',
+      `第 ${i} 次冷却到期后应恢复为 READY`);
+  }
+
+  // 第 10 次 → 禁用
+  const prev = state.getState(uuid, model);
+  const act = sched.decideAction(uuid, model, ErrClass.AUTH, prev.fail_streak);
+  assert.strictEqual(act.action, 'disable', '第 10 次连续失败应禁用');
+  state.recordFailure(uuid, model, { action: act.action, streak: act.streak, error: 'e' });
+  assert.strictEqual(state.getState(uuid, model).state, 'DISABLED');
+
+  // 禁用到期 → 从 1 重新开始（不是第 11 次）
+  const dis = state.getState(uuid, model);
+  state.reviveExpired(dis.disabled_until + 1);
+  const after = state.getState(uuid, model);
+  assert.strictEqual(after.state, 'READY');
+  assert.strictEqual(after.fail_streak, 0);
+  const act2 = sched.decideAction(uuid, model, ErrClass.AUTH, after.fail_streak);
+  assert.strictEqual(act2.streak, 1, '恢复后应从第 1 次重新计数');
+  assert.strictEqual(act2.cooldownMs, 10 * 60_000, '恢复后首次失败回到 10 分钟冷却');
+});
+t('冷却中的 Key 会被调度器跳过 —— streak 才会"冻结"（解释线上现象）', () => {
+  const uuid = 'u-freeze';
+  keys.addKey({ channel: 'openrouter', key: 'sk-freeze', uuid, priority: 0 });
+  const ch = channels.getChannel('openrouter').id;
+  const model = 'm-freeze';
+  rate.clearAll();
+
+  // 让它进入冷却
+  state.recordFailure(uuid, model, {
+    action: 'cooldown', nextRetryAt: Date.now() + 600_000, streak: 1, error: 'e',
+  });
+  // 冷却期内反复挑选，都不该选中它 —— 这正是 streak 冻结的原因
+  for (let i = 0; i < 5; i++) {
+    const k = sched.pickKey(ch, model);
+    assert.ok(!k || k.uuid !== uuid, '冷却中的 Key 不应被选中');
+  }
+  assert.strictEqual(state.getState(uuid, model).fail_streak, 1, '未被选中 → streak 不会增长');
+});
+t('默认策略为填满优先：连续用同一把，用满 RPM 才换（不是轮询）', () => {
+  // 用**独立渠道**避免受前面测试已加的 Key 影响
+  const ch = channels.getChannel('openrouter').id;
+  keys.addKey({ channel: 'openrouter', key: 'sk-ff1', uuid: 'u-ff1', priority: 9 });
+  keys.addKey({ channel: 'openrouter', key: 'sk-ff2', uuid: 'u-ff2', priority: 9 });
+  rate.clearAll();
+  // 每 Key RPM=2：前 2 次必是同一把（填满优先的核心特征），
+  // 第 3 次才因为 RPM 用满换到另一把。
+  const seq = [];
+  for (let i = 0; i < 4; i++) {
+    const k = sched.pickKey(ch, 'm-ff');
+    assert.ok(k, '应能选到 Key');
+    seq.push(k.uuid);
+    rate.recordHit(k.uuid);
+  }
+  assert.strictEqual(seq[0], seq[1], `填满优先：前两次应是同一把，实际 ${seq.join(',')}`);
+  const first = seq[0];
+  const second = seq.find((u) => u !== first);
+  assert.ok(second, `用满 ${rate.limit()} 次后应换到另一把，实际序列 ${seq.join(',')}`);
+  // 切到第二把后也应连续用满
+  assert.strictEqual(seq[2], second, `换过后应继续填满第二把，实际 ${seq.join(',')}`);
+});
+
+t('RPM 软约束：单 Key 达上限仍可用（不能因此不可用）', () => {
+  const ch = channels.getChannel('sensenova').id;
+  // 优先级 99 → 独立成桶，桶里只有它一把
+  keys.addKey({ channel: 'sensenova', key: 'sk-solo', uuid: 'u-solo', priority: 99 });
+  rate.clearAll();
+  for (let i = 0; i < 10; i++) rate.recordHit('u-solo');
+  const k = sched.pickKey(ch, 'm-solo');
+  assert.ok(k && k.uuid === 'u-solo', '唯一一把 Key 达 RPM 上限时仍必须可用');
+});
+t('RPM 计数与剩余时间', () => {
+  rate.clearAll();
+  assert.strictEqual(rate.usage('u-rpm'), 0);
+  rate.recordHit('u-rpm');
+  rate.recordHit('u-rpm');
+  assert.strictEqual(rate.usage('u-rpm'), 2);
+  assert.strictEqual(rate.isLimited('u-rpm'), 2 >= rate.limit());
+  if (rate.limit() > 0) assert.ok(rate.retryAfterMs('u-rpm') > 0, '达上限后应有等待时间');
+  rate.clear('u-rpm');
+  assert.strictEqual(rate.usage('u-rpm'), 0);
+});
+t('stateSummary 同时给出 Key 维度与 key×模型 维度（两页数字才能对上）', () => {
+  // 造一个"同一把 Key 在 2 个模型上冷却"的场景 —— 这正是两口径会分叉的地方
+  keys.addKey({ channel: 'openrouter', key: 'sk-sum1', uuid: 'u-sum1', priority: 5 });
+  const now = Date.now();
+  for (const m of ['mA', 'mB']) {
+    state.recordFailure('u-sum1', m, { action: 'cooldown', nextRetryAt: now + 60_000, streak: 1, error: 'x' });
+  }
+  const s = state.stateSummary();
+  const cellCooling = s.byCell.find((x) => x.state === 'COOLDOWN')?.n ?? 0;
+  const keyCooling = s.byKey.find((x) => x.state === 'COOLDOWN')?.n ?? 0;
+  assert.ok(cellCooling >= 2, `key×模型 维度应至少 2 条冷却，实际 ${cellCooling}`);
+  assert.ok(keyCooling >= 1, `Key 维度应至少 1 把冷却，实际 ${keyCooling}`);
+  assert.ok(cellCooling > keyCooling,
+    `同 Key 多模型时应 cell > key（cell=${cellCooling} key=${keyCooling}）`);
+  assert.strictEqual(s.unhealthyKeys, (s.byKey.find((x) => x.state === 'COOLDOWN')?.n ?? 0)
+    + (s.byKey.find((x) => x.state === 'DISABLED')?.n ?? 0));
+});
+t('stateSummary 剔除已过期的冷却（惰性维护没跑也不该显示"冷却中"）', () => {
+  keys.addKey({ channel: 'openrouter', key: 'sk-sum2', uuid: 'u-sum2', priority: 6 });
+  // 写入一个**已经过期**的冷却
+  state.recordFailure('u-sum2', 'mX', {
+    action: 'cooldown', nextRetryAt: Date.now() - 1000, streak: 1, error: 'x',
+  });
+  const s = state.stateSummary();
+  const hit = s.byCell.find((x) => x.state === 'COOLDOWN')?.n ?? 0;
+  // u-sum2 那条已过期，不该被计为 COOLDOWN
+  const keyCooling = s.byKey.find((x) => x.state === 'COOLDOWN')?.n ?? 0;
+  assert.ok(hit >= 0);
+  // 关键断言：过期的那把不应出现在"异常 Key"里
+  const health = state.keyHealthMap();
+  const h2 = health.get('u-sum2');
+  assert.ok(!h2 || h2.state === 'READY', `过期冷却应视为 READY，实际 ${h2?.state}`);
+  void keyCooling;
+});
+
+console.log('\n[5b] owner 归属隔离（桥做代理层的基础）');
+
+t('addKey 记录 owner；listKeys 按 owner 精确过滤', () => {
+  keys.addKey({ channel: 'openrouter', key: 'sk-own-a', uuid: 'u-own-a', owner: 'alice' });
+  keys.addKey({ channel: 'openrouter', key: 'sk-own-b', uuid: 'u-own-b', owner: 'bob' });
+  keys.addKey({ channel: 'openrouter', key: 'sk-own-sys', uuid: 'u-own-sys' }); // 系统 Key
+
+  const a = keys.listKeys({ owner: 'alice' }).map((k) => k.uuid);
+  const b = keys.listKeys({ owner: 'bob' }).map((k) => k.uuid);
+  const sys = keys.listKeys({ owner: '' }).map((k) => k.uuid);
+
+  assert.deepStrictEqual(a, ['u-own-a']);
+  assert.deepStrictEqual(b, ['u-own-b']);
+  assert.ok(sys.includes('u-own-sys'), '系统 Key 应在 owner="" 里');
+  assert.ok(!sys.includes('u-own-a'), '系统查询不该看到用户的 Key');
+
+  // 不过滤（undefined）能看到全部 —— 管理后台用
+  const allList = keys.listKeys().map((k) => k.uuid);
+  assert.ok(allList.includes('u-own-a') && allList.includes('u-own-sys'));
+});
+
+t('ownerKeyUuids 只返回该 owner 的 uuid（越权删除的判据）', () => {
+  const set = keys.ownerKeyUuids('alice');
+  assert.ok(set.has('u-own-a'));
+  assert.ok(!set.has('u-own-b'), '绝不能包含别人的 Key');
+  assert.ok(!set.has('u-own-sys'), '绝不能包含系统 Key');
+});
+
+t('listKeys(owner 三态)：undefined=全部 / ""=仅系统 / 具体值=仅该用户', () => {
+  const total = keys.listKeys().length;
+  const onlySys = keys.listKeys({ owner: '' }).length;
+  const onlyAlice = keys.listKeys({ owner: 'alice' }).length;
+  assert.strictEqual(onlyAlice, 1);
+  assert.ok(onlySys < total, '系统子集应小于全部');
+  assert.ok(total > onlySys + onlyAlice - 1);
+});
+
+console.log('\n[5c] 「调用过但零成功」判定（桥据此提醒换 Key）');
+
+t('窗口内零成功 → keysWithNoSuccess 命中；有成功则不命中', () => {
+  const mk = (uuid) => keys.addKey({ channel: 'openrouter', key: `sk-${uuid}`, uuid, owner: 'carol' });
+  mk('u-ns-bad');
+  mk('u-ns-good');
+  mk('u-ns-untouched');
+
+  // 坏的：调用 3 次全失败
+  for (let i = 0; i < 3; i++) state.recordFailure('u-ns-bad', 'm1', { action: 'cooldown', nextRetryAt: Date.now() + 1000, streak: 1, error: 'e' });
+  // 好的：失败 2 次但成功过 1 次
+  state.recordFailure('u-ns-good', 'm1', { action: 'cooldown', nextRetryAt: Date.now() + 1000, streak: 1, error: 'e' });
+  state.recordSuccess('u-ns-good', 'm1');
+  // 从没被调用：u-ns-untouched 什么都不写
+
+  const bad = state.keysWithNoSuccess(3).map((x) => x.uuid);
+  assert.ok(bad.includes('u-ns-bad'), '调用过但零成功 → 应判为失效');
+  assert.ok(!bad.includes('u-ns-good'), '有成功过 → 不该判失效');
+  assert.ok(!bad.includes('u-ns-untouched'), '没被调用过 → 不参与判定（用户明确）');
+});
+
+t('dailySummaryByKey 能看出「调用过」与「零成功」', () => {
+  const s = state.dailySummaryByKey(3);
+  const bad = s.get('u-ns-bad');
+  const untouched = s.get('u-ns-untouched');
+  assert.strictEqual(bad.ok, 0);
+  assert.strictEqual(bad.fail, 3);
+  assert.strictEqual(untouched, undefined, '没调用过 → 汇总里没有这条');
+});
+
+t('探针（__probe__）不计入调用统计 —— 否则没被路由用过的 Key 会被误判', () => {
+  keys.addKey({ channel: 'openrouter', key: 'sk-probe-only', uuid: 'u-probe-only', owner: 'carol' });
+  state.recordFailure('u-probe-only', '__probe__', { action: 'none', error: 'e' });
+  state.recordSuccess('u-probe-only', '__probe__');
+  const s = state.dailySummaryByKey(3);
+  assert.strictEqual(s.get('u-probe-only'), undefined,
+    '只被探针碰过的 Key 不该出现在调用统计里');
+  const bad = state.keysWithNoSuccess(3).map((x) => x.uuid);
+  assert.ok(!bad.includes('u-probe-only'), '只有探针 → 不算"调用过"');
+});
+
+t('宽限期：刚绑定的 Key 不参与失效判定', () => {
+  keys.addKey({ channel: 'openrouter', key: 'sk-fresh', uuid: 'u-fresh', owner: 'carol' });
+  state.recordFailure('u-fresh', 'm1', { action: 'cooldown', nextRetryAt: Date.now() + 1000, streak: 1, error: 'e' });
+  // 不给宽限：会命中
+  assert.ok(state.keysWithNoSuccess(3).some((x) => x.uuid === 'u-fresh'));
+  // 给 1 天宽限（刚绑定 < 1 天）：不该命中
+  const graced = state.keysWithNoSuccess(3, { minAgeMs: 24 * 3600_000 });
+  assert.ok(!graced.some((x) => x.uuid === 'u-fresh'), '刚绑定的 Key 应被宽限保护');
+});
+
+t('listOwners：只列出用户 Key 的 owner，排除系统 Key（owner=""）', () => {
+  keys.addKey({ channel: 'openrouter', key: 'sk-ownlist-1', uuid: 'u-ownlist-1', owner: 'dave' });
+  keys.addKey({ channel: 'openrouter', key: 'sk-ownlist-2', uuid: 'u-ownlist-2', owner: 'dave' });
+  const owners = keys.listOwners();
+  const byOwner = new Map(owners.map((o) => [o.owner, o.keyCount]));
+  assert.ok(byOwner.has('dave'), 'dave 应出现在 owner 列表里');
+  assert.strictEqual(byOwner.get('dave'), 2, 'dave 应有 2 把');
+  assert.ok(!byOwner.has(''), '系统 Key（owner=""）不该出现 —— 桥不管系统 Key');
+});
+
+console.log('\n[5d] 桥「自动踢分组」的判据：allFailed 必须计入宽限期');
+
+t('allFailed 的宽限语义：新绑的 Key 在宽限期内不能算失效', () => {
+  // 复现曾经的 bug：overview.noSuccess 无年龄宽限 →
+  // 新绑的 Key 一失败就 allFailed=true → 接上自动踢人会刚绑上就被踢。
+  //
+  // 这里直接验证底层两个口径的差异（HTTP 层在 e2e 里测）：
+  //   无宽限（旧 allFailed 用的）→ 命中
+  //   有宽限（新 allFailed 用的）→ 不命中
+  const uuid = 'u-grace-newbie';
+  keys.addKey({ channel: 'openrouter', key: 'sk-grace-newbie', uuid, owner: 'erin' });
+  state.recordFailure(uuid, 'm1', { action: 'cooldown', nextRetryAt: Date.now() + 1000, streak: 1, error: 'e' });
+
+  const daily = state.dailySummaryByKey(3);
+  const d = daily.get(uuid);
+  assert.ok(d && d.fail > 0 && d.ok === 0, '底层事实：调用过且零成功');
+
+  // 旧口径（无宽限）—— 会误判
+  const rawSet = new Set([...daily.entries()]
+    .filter(([, v]) => v.fail > 0 && v.ok === 0).map(([k]) => k));
+  assert.ok(rawSet.has(uuid), '无宽限口径会把它算作失效（这就是曾经的 bug）');
+
+  // 新口径（带宽限）—— 正确放过
+  const graced = new Set(state.keysWithNoSuccess(3, { minAgeMs: 3 * 24 * 3600_000 }).map((x) => x.uuid));
+  assert.ok(!graced.has(uuid), '带 3 天宽限的口径不该算它失效 —— 新绑的 Key 受保护');
+});
+
+t('宽限期默认值是 3 天（用户明确选择），不是 1 天', () => {
+  // 用户原话：「新绑的 key 有 3 天宽限」
+  assert.strictEqual(config.keyNoSuccessGraceMs, 3 * 24 * 3600 * 1000,
+    `宽限期应为 3 天，实际 ${config.keyNoSuccessGraceMs / 3600000} 小时`);
+});
+
+console.log('\n[6] 适配器 · 错误壳识别');
+t('商汤 gRPC code 16 → AUTH', () => {
+  const v = sensenova.classify(401, {}, JSON.stringify({ error: { code: 16, message: 'Forbidden' } }));
+  assert.strictEqual(v.errClass, ErrClass.AUTH);
+  assert.strictEqual(v.code, 16);
+});
+t('商汤 gRPC code 8 → QUOTA', () => {
+  const v = sensenova.classify(429, {}, JSON.stringify({ error: { code: 8, message: 'ResourceExhausted' } }));
+  assert.strictEqual(v.errClass, ErrClass.QUOTA);
+});
+t('商汤 gRPC code 3 → REQUEST_FAULT', () => {
+  const v = sensenova.classify(400, {}, JSON.stringify({ error: { code: 3, message: 'InvalidArgument' } }));
+  assert.strictEqual(v.errClass, ErrClass.REQUEST_FAULT);
+});
+t('商汤 成功状态 → OK', () => {
+  const v = sensenova.classify(200, {}, '{}');
+  assert.strictEqual(v.errClass, ErrClass.OK);
+});
+t('书生标准 OpenAI 壳 → AUTH', () => {
+  const body = JSON.stringify({ error: { message: 'invalid API key', type: 'invalid_request_error', code: 'invalid_api_key', trace_id: 'abc123' }, request_id: 'req_x' });
+  const v = intern.classify(401, {}, body);
+  assert.strictEqual(v.errClass, ErrClass.AUTH);
+  assert.strictEqual(v.traceId, 'abc123');
+});
+t('书生 rate_limit_exceeded → QUOTA', () => {
+  const v = intern.classify(429, {}, JSON.stringify({ error: { message: 'rate limited', code: 'rate_limit_exceeded' } }));
+  assert.strictEqual(v.errClass, ErrClass.QUOTA);
+});
+t('书生 model_not_found → CONFIG_FAULT', () => {
+  const v = intern.classify(404, {}, JSON.stringify({ error: { message: 'model not found', code: 'model_not_found' } }));
+  assert.strictEqual(v.errClass, ErrClass.CONFIG_FAULT);
+});
+
+// ===== 以下为 2026-10-06 用真 Key 实测到的原始响应，锁死防回归 =====
+console.log('  --- 真 Key 实测样本 ---');
+
+t('商汤 429 RateLimitExceeded.EndpointRPMExceeded → QUOTA（不是 transient）', () => {
+  // 原始壳：{"error":{"message":"inference exceeds tpm/rpm limit",
+  //          "type":"rate_limit_error","code":"RateLimitExceeded.EndpointRPMExceeded"}}
+  const body = JSON.stringify({
+    error: {
+      message: 'inference exceeds tpm/rpm limit',
+      type: 'rate_limit_error',
+      code: 'RateLimitExceeded.EndpointRPMExceeded',
+    },
+  });
+  const v = sensenova.classify(429, {}, body);
+  assert.strictEqual(v.errClass, ErrClass.QUOTA, `实际 ${v.errClass}`);
+});
+
+t('商汤 404 code "5" → CONFIG_FAULT（模型不在该渠道，必须能落下一渠道）', () => {
+  // 原始壳：{"error":{"message":"model route not found","type":"invalid_request_error","code":"5"}}
+  const body = JSON.stringify({ error: { message: 'model route not found', type: 'invalid_request_error', code: '5' } });
+  const v = sensenova.classify(404, {}, body);
+  assert.strictEqual(v.errClass, ErrClass.CONFIG_FAULT, `实际 ${v.errClass}`);
+});
+
+t('商汤 400 code "3" + MaxTokens → REQUEST_FAULT（不能被 token.*invalid 误判成 AUTH）', () => {
+  const body = JSON.stringify({
+    error: { message: 'field MaxTokens invalid, should be in [1, 131072]', type: 'invalid_request_error', param: 'max_tokens', code: '3' },
+  });
+  const v = sensenova.classify(400, {}, body);
+  assert.strictEqual(v.errClass, ErrClass.REQUEST_FAULT, `实际 ${v.errClass}`);
+});
+
+t('书生 404 model_not_available → CONFIG_FAULT（不是 transient）', () => {
+  // 原始壳：{"error":{"message":"deepseek-v4-pro is not supported by TokenPlan",
+  //          "type":"model_not_available","code":"model_not_available","trace_id":"..."}}
+  const body = JSON.stringify({
+    error: {
+      message: 'deepseek-v4-pro is not supported by TokenPlan',
+      type: 'model_not_available', param: null,
+      code: 'model_not_available', trace_id: 'ffd26fc3cee72ee6f7611da1ae96e1a1',
+    },
+    request_id: 'req_2a3941aa',
+  });
+  const v = intern.classify(404, {}, body);
+  assert.strictEqual(v.errClass, ErrClass.CONFIG_FAULT, `实际 ${v.errClass}`);
+  assert.strictEqual(v.traceId, 'ffd26fc3cee72ee6f7611da1ae96e1a1');
+});
+
+t('基类兜底：识别不出时以 HTTP 状态纠正 TRANSIENT', () => {
+  // 故意用一条不含任何语义关键词的未知错误 —— 适配器只能返回 TRANSIENT，
+  // 基类应据 HTTP 429 纠正为 QUOTA。
+  const v = sensenova.classify(429, {}, JSON.stringify({ error: { message: 'zzz unknown novel wording' } }));
+  assert.strictEqual(v.errClass, ErrClass.QUOTA, `实际 ${v.errClass}`);
+  // 反向：状态也是 5xx（TRANSIENT）时，保持 TRANSIENT
+  const v2 = sensenova.classify(500, {}, JSON.stringify({ error: { message: 'zzz unknown novel wording' } }));
+  assert.strictEqual(v2.errClass, ErrClass.TRANSIENT, `实际 ${v2.errClass}`);
+});
+
+t('CONFIG_FAULT 语义：可重试（换渠道）而非 fatal', () => {
+  assert.ok(RETRYABLE.has(ErrClass.CONFIG_FAULT), 'CONFIG_FAULT 应在 RETRYABLE 里');
+  assert.ok(!FATAL_FOR_REQUEST.has(ErrClass.CONFIG_FAULT), 'CONFIG_FAULT 不应在 FATAL_FOR_REQUEST 里');
+  assert.ok(FATAL_FOR_CHANNEL.has(ErrClass.CONFIG_FAULT), 'CONFIG_FAULT 应在 FATAL_FOR_CHANNEL 里');
+});
+
+t('CONFIG_FAULT 决策 → skip_channel（不惩罚 Key，直接换渠道）', () => {
+  const act = sched.decideAction('x', 'm', ErrClass.CONFIG_FAULT, 0);
+  assert.strictEqual(act.action, 'skip_channel');
+  assert.strictEqual(act.retry, true);
+});
+
+t('REQUEST_FAULT 决策 → 不重试（请求本身有问题）', () => {
+  const act = sched.decideAction('x', 'm', ErrClass.REQUEST_FAULT, 0);
+  assert.strictEqual(act.retry, false);
+  assert.strictEqual(act.action, 'none');
+});
+
+console.log('\n[4c] OpenRouter 适配器（免费模型过滤 + 错误壳）');
+const openrouter = (await import('../src/adapters/openrouter.mjs')).default;
+const { isFreeModel } = await import('../src/adapters/openrouter.mjs');
+
+t('免费判定：pricing 全 0 视为免费', () => {
+  assert.ok(isFreeModel({ id: 'x/y:free', pricing: { prompt: '0', completion: '0' } }));
+  assert.ok(!isFreeModel({ id: 'x/y', pricing: { prompt: '0.000001', completion: '0.000002' } }));
+  // 只有 input 免费、output 收费 → 不算免费
+  assert.ok(!isFreeModel({ id: 'x/y:free', pricing: { prompt: '0', completion: '0.000002' } }));
+});
+
+t('免费判定：免费但不带 :free 后缀的例外', () => {
+  assert.ok(isFreeModel({ id: 'openrouter/free', pricing: { prompt: '0', completion: '0' } }));
+  // 无 pricing 字段时回落白名单
+  assert.ok(isFreeModel({ id: 'openrouter/free' }));
+  assert.ok(!isFreeModel({ id: 'openai/gpt-4o' }));
+});
+
+t('parseModels 默认只保留免费模型（465 → 16 的真实比例）', () => {
+  const json = {
+    data: [
+      { id: 'nvidia/nemotron-3-super-120b-a12b:free', pricing: { prompt: '0', completion: '0' } },
+      { id: 'google/gemma-4-31b-it:free', pricing: { prompt: '0', completion: '0' } },
+      { id: 'openai/gpt-4o', pricing: { prompt: '0.0000025', completion: '0.00001' } },
+      { id: 'anthropic/claude-x', pricing: { prompt: '0.000003', completion: '0.000015' } },
+    ],
+  };
+  const free = openrouter.parseModels(json);
+  assert.deepStrictEqual(free, ['nvidia/nemotron-3-super-120b-a12b:free', 'google/gemma-4-31b-it:free']);
+  // 显式要求全量时才给全部
+  const all = openrouter.parseModels(json, { freeOnly: false });
+  assert.strictEqual(all.length, 4);
+});
+
+t('OpenRouter 401 错误壳 → AUTH（数字 code）', () => {
+  const v = openrouter.classify(401, {}, JSON.stringify({ error: { message: 'User not found.', code: 401 } }));
+  assert.strictEqual(v.errClass, ErrClass.AUTH, `实际 ${v.errClass}`);
+  const v2 = openrouter.classify(401, {}, JSON.stringify({ error: { message: 'No cookie auth credentials found', code: 401 } }));
+  assert.strictEqual(v2.errClass, ErrClass.AUTH, `实际 ${v2.errClass}`);
+});
+
+t('OpenRouter 402 余额不足 → QUOTA', () => {
+  const v = openrouter.classify(402, {}, JSON.stringify({ error: { message: 'Insufficient credits', code: 402 } }));
+  assert.strictEqual(v.errClass, ErrClass.QUOTA, `实际 ${v.errClass}`);
+});
+
+t('OpenRouter 模型无可用提供方 → CONFIG_FAULT（可换渠道）', () => {
+  const v = openrouter.classify(404, {}, JSON.stringify({ error: { message: 'No allowed providers are available for the selected model', code: 404 } }));
+  assert.strictEqual(v.errClass, ErrClass.CONFIG_FAULT, `实际 ${v.errClass}`);
+});
+
+// 真 Key 实测（2026-10-06）：OpenRouter 的 `Provider returned error` 是**包装壳**，
+// 真原因藏在 metadata.raw 里。不剥开会误判成 request_fault → 不换渠道 → 白等。
+t('OpenRouter metadata.raw 剥壳：地区限制 → CONFIG_FAULT（可换渠道）', () => {
+  const body = JSON.stringify({
+    error: {
+      message: 'Provider returned error',
+      code: 400,
+      metadata: {
+        raw: JSON.stringify({
+          error: { code: 400, message: 'User location is not supported for the API use.', status: 'FAILED_PRECONDITION' },
+        }),
+        provider_name: 'Google AI Studio',
+        provider_error_code: '400',
+      },
+    },
+  });
+  const v = openrouter.classify(400, {}, body);
+  assert.strictEqual(v.errClass, ErrClass.CONFIG_FAULT, `实际 ${v.errClass}（不能是 request_fault，否则不会换渠道）`);
+  // 消息必须带出真原因，否则日志里看不出为什么换渠道
+  assert.ok(v.message.includes('location is not supported'), `message 应含真原因，实际: ${v.message}`);
+  assert.ok(v.message.includes('Google AI Studio'), 'message 应标明是哪个提供方');
+});
+
+t('OpenRouter agentic harness 门禁 → CONFIG_FAULT', () => {
+  const body = JSON.stringify({
+    error: {
+      message: 'thinkingmachines/inkling-small:free is only available on agentic harnesses. Try plugging it into a coding agent',
+      code: 403,
+      metadata: { failed_routing_step: 'Gate Free Endpoints by Agentic Harness' },
+    },
+  });
+  const v = openrouter.classify(403, {}, body);
+  assert.strictEqual(v.errClass, ErrClass.CONFIG_FAULT, `实际 ${v.errClass}`);
+});
+
+t('OpenRouter 真 AUTH 错误不被 provider 剥壳误伤', () => {
+  // 没有 metadata 时按原逻辑走
+  const v = openrouter.classify(401, {}, JSON.stringify({ error: { message: 'User not found.', code: 401 } }));
+  assert.strictEqual(v.errClass, ErrClass.AUTH, `实际 ${v.errClass}`);
+});
+
+t('OpenRouter 提供方侧限流 → QUOTA（可恢复，不是 404）', () => {
+  // 真 Key 实测：免费模型经常被上游 provider 限流
+  const body = JSON.stringify({
+    error: {
+      message: 'Provider returned error',
+      code: 429,
+      metadata: {
+        raw: JSON.stringify({ error: { code: 429, message: 'google/gemma-4-31b-it:free is temporarily rate-limited upstream. Please retry shortly' } }),
+        provider_name: 'Google AI Studio',
+      },
+    },
+  });
+  const v = openrouter.classify(429, {}, body);
+  assert.strictEqual(v.errClass, ErrClass.QUOTA, `实际 ${v.errClass}（不能报 404 骗客户端说模型不存在）`);
+  assert.ok(v.message.includes('限流'), `message 应说明是限流: ${v.message}`);
+});
+
+console.log('\n[4d] 模型名友好化（去供应商前缀 + 去 :free 标签 + 大小写两形态）');
+const fr = await import('../src/util/friendly.mjs');
+
+t('stripVendor：去掉供应商前缀', () => {
+  assert.strictEqual(fr.stripVendor('deepseek.ai/deepseek-v4.1-flash:free'), 'deepseek-v4.1-flash:free');
+  assert.strictEqual(fr.stripVendor('google/gemma-4-31b-it:free'), 'gemma-4-31b-it:free');
+  assert.strictEqual(fr.stripVendor('glm-5.2'), 'glm-5.2');
+});
+
+t('stripTags：去掉尾部 :free 等标签', () => {
+  assert.strictEqual(fr.stripTags('deepseek-v4.1-flash:free'), 'deepseek-v4.1-flash');
+  assert.strictEqual(fr.stripTags('gemma-4-31b-it:free'), 'gemma-4-31b-it');
+  assert.strictEqual(fr.stripTags('glm-5.2'), 'glm-5.2');
+});
+
+t('friendlyName：需求里的主例子', () => {
+  // deepseek.ai/deepseek-v4.1-flash:free → deepseek-v4.1-flash
+  assert.strictEqual(fr.friendlyName('deepseek.ai/deepseek-v4.1-flash:free'), 'deepseek-v4.1-flash');
+  assert.strictEqual(fr.friendlyName('nvidia/nemotron-3-super-120b-a12b:free'), 'nemotron-3-super-120b-a12b');
+});
+
+t('pascalName：分段首字母大写，数字与点号保持原样', () => {
+  assert.strictEqual(fr.pascalName('deepseek.ai/deepseek-v4.1-flash:free'), 'Deepseek-V4.1-Flash');
+  assert.strictEqual(fr.pascalName('google/gemma-4-31b-it:free'), 'Gemma-4-31b-It');
+  assert.strictEqual(fr.pascalName('minimax-m3'), 'Minimax-M3');
+});
+
+t('friendlyVariants：一个上游名 → 两种友好形态', () => {
+  assert.deepStrictEqual(
+    fr.friendlyVariants('deepseek.ai/deepseek-v4.1-flash:free'),
+    ['deepseek-v4.1-flash', 'Deepseek-V4.1-Flash'],
+  );
+});
+
+t('needsFriendlyAlias：干净的名字不造别名', () => {
+  assert.ok(fr.needsFriendlyAlias('deepseek.ai/x:free'), '带前缀+标签 → 需要');
+  assert.ok(fr.needsFriendlyAlias('x/y'), '带前缀 → 需要');
+  assert.ok(fr.needsFriendlyAlias('gemma-4-31b-it:free'), '带标签 → 需要');
+  assert.ok(!fr.needsFriendlyAlias('glm-5.2'), '干净名 → 不需要');
+  assert.ok(!fr.needsFriendlyAlias('intern-s2'), '干净名 → 不需要');
+});
+
+console.log('\n[4e] 自动生成友好别名（拉取时）');
+t('seedFriendlyAliases：为噪音模型名建两种别名，原名保留', () => {
+  const ch = channels.getChannel('openrouter');
+  const ids = [
+    'deepseek.ai/deepseek-v4.1-flash:free',   // 需友好化
+    'nvidia/nemotron-3-super-120b-a12b:free', // 需友好化
+    'glm-5.2',                                 // 干净，不造别名
+  ];
+  const res = catalog.seedFriendlyAliases(ch.id, ids);
+  assert.ok(res.created >= 4, `应至少建 4 条（2 个模型 × 2 形态），实际 ${res.created}`);
+
+  // 用小写的友好名解析 → 应命中 openrouter 渠道，上游名是带前缀的原文
+  const c1 = aliases.resolveCandidates('deepseek-v4.1-flash');
+  const or1 = c1.find((x) => x.channelName === 'openrouter');
+  assert.ok(or1, 'openrouter 渠道应有该别名');
+  assert.strictEqual(or1.upstreamName, 'deepseek.ai/deepseek-v4.1-flash:free');
+
+  // 大写的友好名同样能解析
+  const c2 = aliases.resolveCandidates('Deepseek-V4.1-Flash');
+  const or2 = c2.find((x) => x.channelName === 'openrouter');
+  assert.ok(or2, '首字母大写形态也应能解析');
+  assert.strictEqual(or2.upstreamName, 'deepseek.ai/deepseek-v4.1-flash:free');
+
+  // 原名照样能用（同名直通）
+  const c3 = aliases.resolveCandidates('deepseek.ai/deepseek-v4.1-flash:free');
+  assert.ok(c3.length > 0, '上游原名必须仍然可调用');
+});
+
+t('seedFriendlyAliases：幂等（重复跑不产生重复记录）', () => {
+  const ch = channels.getChannel('openrouter');
+  const before = aliases.listAliases({ channel: 'openrouter' }).length;
+  catalog.seedFriendlyAliases(ch.id, ['deepseek.ai/deepseek-v4.1-flash:free']);
+  const after = aliases.listAliases({ channel: 'openrouter' }).length;
+  assert.strictEqual(after, before, '重复拉取不应重复建别名');
+});
+
+t('removeFriendlyAliases：只删自动生成的，不动手工映射', () => {
+  const ch = channels.getChannel('openrouter');
+  // 手工建一条不该被删
+  aliases.addAlias({ public_name: 'my-manual-name', upstream_name: 'glm-5.2', channel: 'openrouter' });
+  const removed = catalog.removeFriendlyAliases(ch.id);
+  assert.ok(removed >= 2, `应删掉自动生成的别名，实际 ${removed}`);
+  // listAliases 返回下划线字段（仓储层原始形态）
+  const left = aliases.listAliases({ channel: 'openrouter' }).map((a) => a.public_name);
+  assert.ok(!left.includes('deepseek-v4.1-flash'), '自动别名应已删除');
+  assert.ok(left.includes('my-manual-name'), `手工映射必须保留，实际剩: ${left.join(',')}`);
+});
+
+console.log('[7] token');
+await ta('创建与校验 token', async () => {
+  const { token } = tokens.createToken('tester');
+  assert.ok(token.startsWith('sk-api2api-'));
+  assert.strictEqual(tokens.verifyToken(token), true);
+  assert.strictEqual(tokens.verifyToken('bogus'), false);
+  const list = tokens.listTokens();
+  assert.ok(list.length >= 1);
+  assert.ok(!JSON.stringify(list).includes(token), '列表不得含明文 token');
+});
+
+// ---------- 验活：顺序试模型，首个成功即返回 ----------
+console.log('\n[9] 验活 · 「发 hi 等首字」逐个试模型');
+
+t('候选模型按上游声明顺序（seq），不做名字打分重排', () => {
+  // 造一个渠道的目录，顺序刻意与字母序不同
+  const ch = channels.getChannel('sensenova');
+  catalog.replaceChannelModels(ch.id, ['zzz-last-model', 'aaa-first-model', 'mmm-mid-model']);
+  const cands = firstbyte.listProbeCandidates('sensenova');
+  assert.deepStrictEqual(cands, ['zzz-last-model', 'aaa-first-model', 'mmm-mid-model'],
+    '必须严格按写入顺序（= 上游声明顺序），不能按字母序或名字特征重排');
+});
+
+await ta('第 1 个模型限流失败 → 第 2 个成功 → 立刻返回，不试第 3 个', async () => {
+  const ch = channels.getChannel('sensenova');
+  catalog.replaceChannelModels(ch.id, ['m1-rate-limited', 'm2-ok', 'm3-should-not-try']);
+
+  const tried = [];
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async (url, opt) => {
+    const model = JSON.parse(opt.body).model;
+    tried.push(model);
+    if (model === 'm1-rate-limited') {
+      return new Response(JSON.stringify({ error: { code: 'RateLimitExceeded', message: 'inference exceeds tpm/rpm limit' } }),
+        { status: 429, headers: { 'Content-Type': 'application/json' } });
+    }
+    // m2-ok：返回一个 SSE 流，首帧即带内容
+    const sse = 'data: ' + JSON.stringify({ choices: [{ delta: { content: 'hi' } }] }) + '\n\n';
+    return new Response(sse, { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+  };
+
+  try {
+    const r = await firstbyte.verifyKeyFirstByte('sk-test', 'sensenova');
+    assert.strictEqual(r.ok, true, '第 2 个模型能出字 → 整体应成功');
+    assert.strictEqual(r.model, 'm2-ok', `应用 m2-ok，实际 ${r.model}`);
+    assert.strictEqual(r.attempted, 2, `应只试 2 个模型，实际 ${r.attempted}`);
+    assert.deepStrictEqual(tried, ['m1-rate-limited', 'm2-ok'],
+      '第 3 个模型绝不能被尝试（首个成功即返回）');
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
+await ta('限流不会被当成"Key 坏了"→ 继续试下一个模型（这正是绑不上的原因）', async () => {
+  const ch = channels.getChannel('sensenova');
+  catalog.replaceChannelModels(ch.id, ['m1-limited', 'm2-limited', 'm3-ok']);
+
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async (url, opt) => {
+    const model = JSON.parse(opt.body).model;
+    if (model !== 'm3-ok') {
+      return new Response(JSON.stringify({ error: { code: 'RateLimitExceeded', message: 'inference exceeds tpm/rpm limit' } }),
+        { status: 429, headers: { 'Content-Type': 'application/json' } });
+    }
+    return new Response('data: ' + JSON.stringify({ choices: [{ delta: { content: 'x' } }] }) + '\n\n',
+      { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+  };
+  try {
+    const r = await firstbyte.verifyKeyFirstByte('sk-test', 'sensenova');
+    assert.strictEqual(r.ok, true);
+    assert.strictEqual(r.model, 'm3-ok');
+    assert.strictEqual(r.attempted, 3);
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
+await ta('全部模型都失败 → ok=false，且 tried 记录每一个模型', async () => {
+  const ch = channels.getChannel('sensenova');
+  catalog.replaceChannelModels(ch.id, ['a1', 'a2']);
+
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(
+    JSON.stringify({ error: { code: 'RateLimitExceeded', message: 'limit' } }),
+    { status: 429, headers: { 'Content-Type': 'application/json' } },
+  );
+  try {
+    const r = await firstbyte.verifyKeyFirstByte('sk-test', 'sensenova');
+    assert.strictEqual(r.ok, false);
+    assert.strictEqual(r.attempted, 2);
+    assert.deepStrictEqual(r.tried.map((x) => x.model), ['a1', 'a2']);
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
+await ta('★ 严格串行：任一时刻最多只有 1 个请求在飞（用户明确要求"不能同时打"）', async () => {
+  const ch = channels.getChannel('sensenova');
+  catalog.replaceChannelModels(ch.id, ['s1', 's2', 's3', 's4-ok']);
+
+  let inflight = 0;
+  let maxInflight = 0;
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async (url, opt) => {
+    inflight += 1;
+    maxInflight = Math.max(maxInflight, inflight);
+    await new Promise((r) => setTimeout(r, 20));
+    inflight -= 1;
+    const model = JSON.parse(opt.body).model;
+    if (model !== 's4-ok') {
+      return new Response(JSON.stringify({ error: { code: 'RateLimitExceeded', message: 'tpm/rpm limit' } }),
+        { status: 429, headers: { 'Content-Type': 'application/json' } });
+    }
+    return new Response('data: ' + JSON.stringify({ choices: [{ delta: { content: 'hi' } }] }) + '\n\n',
+      { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+  };
+  try {
+    const r = await firstbyte.verifyKeyFirstByte('sk-test', 'sensenova');
+    assert.strictEqual(r.ok, true);
+    assert.strictEqual(r.model, 's4-ok');
+    assert.strictEqual(maxInflight, 1,
+      `必须是严格串行（maxInflight 应为 1，实际 ${maxInflight}）—— 并发会加剧上游限流`);
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
+await ta('模型不存在（CONFIG_FAULT）→ 继续试下一个，不误判 Key 坏了', async () => {
+  const ch = channels.getChannel('sensenova');
+  catalog.replaceChannelModels(ch.id, ['c1-missing', 'c2-missing', 'c3-missing', 'c4-ok']);
+
+  const tried = [];
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async (url, opt) => {
+    const model = JSON.parse(opt.body).model;
+    tried.push(model);
+    if (model !== 'c4-ok') {
+      // 商汤「模型不存在」= 字符串 code "5"
+      return new Response(JSON.stringify({ error: { code: '5', message: 'model not found' } }),
+        { status: 404, headers: { 'Content-Type': 'application/json' } });
+    }
+    return new Response('data: ' + JSON.stringify({ choices: [{ delta: { content: 'hi' } }] }) + '\n\n',
+      { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+  };
+  try {
+    const r = await firstbyte.verifyKeyFirstByte('sk-test', 'sensenova');
+    assert.strictEqual(r.ok, true, '第 4 个能用 → 整体应成功');
+    assert.strictEqual(r.model, 'c4-ok');
+    assert.deepStrictEqual(tried, ['c1-missing', 'c2-missing', 'c3-missing', 'c4-ok'],
+      '必须按顺序跳过所有"不存在的模型"');
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
+await ta('认证失败也要试完全部模型（单模型无权限 ≠ Key 坏了）', async () => {
+  const ch = channels.getChannel('sensenova');
+  catalog.replaceChannelModels(ch.id, ['p1', 'p2', 'p3']);
+
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(
+    JSON.stringify({ error: { code: 16, message: 'Forbidden' } }),
+    { status: 401, headers: { 'Content-Type': 'application/json' } });
+  try {
+    const r = await firstbyte.verifyKeyFirstByte('sk-test', 'sensenova');
+    assert.strictEqual(r.ok, false);
+    assert.strictEqual(r.attempted, 3, '应把 3 个模型都试完（商汤 PERMISSION_DENIED 可能只是单模型无权限）');
+    assert.strictEqual(r.errClass, 'auth', '全失败时主导错误应是认证错误（信息最明确）');
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
+t('★ 验活超时配置必须存在 —— 否则 deadline=NaN 会让每个模型被瞬间中断', () => {
+  assert.strictEqual(typeof config.verifyTotalBudgetMs, 'number',
+    'config.verifyTotalBudgetMs 必须是数字（曾为 undefined → NaN → 每个请求秒断）');
+  assert.ok(Number.isFinite(config.verifyTotalBudgetMs) && config.verifyTotalBudgetMs > 0,
+    `verifyTotalBudgetMs 应 > 0，实际 ${config.verifyTotalBudgetMs}`);
+  assert.ok(Number.isFinite(Date.now() + config.verifyTotalBudgetMs),
+    'deadline 必须是有限数字');
+  assert.ok(Number.isFinite(config.verifyPerModelTimeoutMs) && config.verifyPerModelTimeoutMs > 0);
+});
+
+console.log('\n[10] 复核续期 · 「复核通过 → 再保 3 天」（滑动窗口）');
+
+t('renewGrace / graceUntilOf 基本读写', () => {
+  const uuid = 'u-renew-1';
+  keys.addKey({ channel: 'intern', key: 'sk-renew-1', uuid, owner: 'frank' });
+  assert.strictEqual(keys.graceUntilOf(uuid), 0, '初始无豁免');
+
+  const now = Date.now();
+  const until = keys.renewGrace(uuid, 3 * 24 * 3600_000, now);
+  assert.strictEqual(until, now + 3 * 24 * 3600_000);
+  assert.strictEqual(keys.graceUntilOf(uuid), until, '写入应可读回');
+});
+
+t('★ renewGrace 取 max：晚到的复核不会把窗口缩短', () => {
+  const uuid = 'u-renew-2';
+  keys.addKey({ channel: 'intern', key: 'sk-renew-2', uuid, owner: 'frank' });
+  const t0 = 1_000_000_000_000;
+  const a = keys.renewGrace(uuid, 3 * 24 * 3600_000, t0);           // 先到
+  const b = keys.renewGrace(uuid, 3 * 24 * 3600_000, t0 - 3600_000); // 后到但时钟更早
+  assert.strictEqual(keys.graceUntilOf(uuid), a, '取 max，不应该被更早的时间戳覆盖');
+  assert.strictEqual(b, t0 - 3600_000 + 3 * 24 * 3600_000, 'b 是它自己算出来的值');
+});
+
+t('★ 复核续期内（grace_until > now）→ 不参与零成功判定', () => {
+  const uuid = 'u-renew-3';
+  keys.addKey({ channel: 'intern', key: 'sk-renew-3', uuid, owner: 'frank' });
+  state.recordFailure(uuid, 'm1', { action: 'cooldown', nextRetryAt: Date.now() + 1000, streak: 1, error: 'e' });
+
+  const now = Date.now();
+  // 不加豁免时：命中（而且它够老 —— 用 minAgeMs=0 破除年龄门槛干扰）
+  const before = new Set(state.keysWithNoSuccess(3, { minAgeMs: 0, now }).map((x) => x.uuid));
+  assert.ok(before.has(uuid), '续期前应命中失效');
+
+  // 续期后：不再命中
+  keys.renewGrace(uuid, 3 * 24 * 3600_000, now);
+  const after = new Set(state.keysWithNoSuccess(3, { minAgeMs: 0, now }).map((x) => x.uuid));
+  assert.ok(!after.has(uuid), '复核续期内必须豁免 —— 这就是「通过后继续三天缓冲」');
+});
+
+t('★ 续期到期后又恢复判定（窗口是滑动的，不是永久豁免）', () => {
+  const uuid = 'u-renew-4';
+  keys.addKey({ channel: 'intern', key: 'sk-renew-4', uuid, owner: 'frank' });
+  state.recordFailure(uuid, 'm1', { action: 'cooldown', nextRetryAt: Date.now() + 1000, streak: 1, error: 'e' });
+
+  const now = Date.now();
+  // ⚠️ 用短续期（1 小时）来测：若续 3 天，快进到到期时 key_daily 已落在 3 天窗口外，
+  //    查询本身查不到记录，测不出「恢复判定」这件事。
+  const until = keys.renewGrace(uuid, 3600_000, now);
+  // 到期前一刻：仍豁免
+  const justBefore = new Set(state.keysWithNoSuccess(3, { minAgeMs: 0, now: until - 1 }).map((x) => x.uuid));
+  assert.ok(!justBefore.has(uuid), '到期前应仍豁免');
+  // 到期后：重新命中
+  const justAfter = new Set(state.keysWithNoSuccess(3, { minAgeMs: 0, now: until + 1 }).map((x) => x.uuid));
+  assert.ok(justAfter.has(uuid), '到期后应恢复判定 —— 不能永久豁免');
+});
+
+t('★ 复核续期与「新绑宽限」是两重独立豁免', () => {
+  // 一把不新（created_at 拨到 10 天前）、但复核续期中的 Key
+  const uuid = 'u-renew-5';
+  keys.addKey({ channel: 'intern', key: 'sk-renew-5', uuid, owner: 'frank' });
+  const now = Date.now();
+  // 手工把 created_at 拨老
+  getDb().prepare('UPDATE channel_key SET created_at = ? WHERE uuid = ?')
+    .run(now - 10 * 24 * 3600_000, uuid);
+  state.recordFailure(uuid, 'm1', { action: 'cooldown', nextRetryAt: now + 1000, streak: 1, error: 'e' });
+
+  // 无豁免 + 够老 → 命中
+  const noGrace = new Set(state.keysWithNoSuccess(3, { minAgeMs: 3 * 24 * 3600_000, now }).map((x) => x.uuid));
+  assert.ok(noGrace.has(uuid), '10 天前绑定且无豁免 → 应命中');
+
+  // 加复核续期 → 即使够老也豁免
+  keys.renewGrace(uuid, 3 * 24 * 3600_000, now);
+  const withGrace = new Set(state.keysWithNoSuccess(3, { minAgeMs: 3 * 24 * 3600_000, now }).map((x) => x.uuid));
+  assert.ok(!withGrace.has(uuid), '复核续期应能豁免「够老」的 Key');
+});
+
+t('续期配置项存在且为 3 天（用户明确要求）', () => {
+  assert.strictEqual(config.keyGraceRenewMs, 3 * 24 * 3600 * 1000,
+    `复核续期应为 3 天，实际 ${config.keyGraceRenewMs / 3600000} 小时`);
+});
+
+closeDb();
+fs.rmSync(TMP, { recursive: true, force: true });
+
+console.log(`\n=== 结果：${pass} 通过 / ${fail} 失败 ===\n`);
+process.exit(fail > 0 ? 1 : 0);

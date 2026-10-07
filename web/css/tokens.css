@@ -1,0 +1,47 @@
+/* 设计令牌 —— 浅色主题（IDE Theme: light） */
+:root {
+  --bg: #f7f7f5;
+  --bg-elev: #ffffff;
+  --bg-sunken: #f1efe8;
+  --bg-hover: #f4f4f2;
+
+  --text: #2c2c2a;
+  --text-dim: #5f5e5a;
+  --text-mute: #888780;
+
+  --border: #e3e2dd;
+  --border-strong: #cdccc5;
+
+  --accent: #534ab7;
+  --accent-hover: #453da0;
+  --accent-soft: #eeedfe;
+  --accent-text: #3c3489;
+
+  --ok: #0f6e56;
+  --ok-soft: #e1f5ee;
+  --warn: #854f0b;
+  --warn-soft: #faeeda;
+  --err: #a32d2d;
+  --err-soft: #fcebeb;
+  --info: #185fa5;
+  --info-soft: #e6f1fb;
+  --neutral: #5f5e5a;
+  --neutral-soft: #f1efe8;
+
+  --radius-sm: 6px;
+  --radius: 10px;
+  --radius-lg: 14px;
+
+  --shadow-sm: 0 1px 2px rgba(20, 20, 19, .06);
+  --shadow: 0 2px 8px rgba(20, 20, 19, .08);
+  --shadow-lg: 0 12px 32px rgba(20, 20, 19, .14);
+
+  --font: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+          "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans SC", sans-serif;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+          "Liberation Mono", monospace;
+
+  --topbar-h: 56px;
+  --tabs-h: 46px;
+  --page-max: 1280px;
+}

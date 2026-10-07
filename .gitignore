@@ -1,0 +1,29 @@
+# ============================================================
+# 运行时数据 —— 绝不提交
+# 含：上游 Key 的 AES-GCM 密文、主密钥、管理员 token
+# ============================================================
+data/
+data-*/
+*.db
+*.db-shm
+*.db-wal
+master.key
+admin_token
+
+# 开发临时物
+_shot/
+_tmp/
+*.log
+
+# 依赖（本项目零依赖，保险起见）
+node_modules/
+
+# 编辑器 / 系统
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# 内部维护清单（含桥接业务信息，不公开）
+OPENSOURCE-DESCRIPTION.md

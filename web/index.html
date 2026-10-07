@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>api2api · 聚合路由控制台</title>
+<meta name="api2api-base" content="">
+<link rel="stylesheet" href="/css/tokens.css">
+<link rel="stylesheet" href="/css/app.css">
+</head>
+<body>
+
+<div class="app">
+
+  <!-- 顶栏 -->
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-dot"></span>
+      <span class="brand-name">api2api</span>
+      <span class="brand-sub">多渠道 Key 聚合路由</span>
+    </div>
+    <div class="topbar-right">
+      <span id="healthPill" class="pill pill-idle">连接中…</span>
+      <button id="btnRefresh" class="btn btn-ghost" type="button">刷新</button>
+    </div>
+  </header>
+
+  <!-- 导航 -->
+  <nav class="tabs" id="tabs">
+    <button class="tab is-active" type="button" data-view="keys">Key 管理</button>
+    <button class="tab" type="button" data-view="aliases">模型</button>
+    <button class="tab" type="button" data-view="channels">渠道</button>
+    <button class="tab" type="button" data-view="probe">测活</button>
+    <button class="tab" type="button" data-view="stats">观测</button>
+    <button class="tab" type="button" data-view="settings">设置</button>
+  </nav>
+
+  <!-- 主体 -->
+  <main class="main">
+
+    <!-- 视图：Key 管理 -->
+    <section class="view is-active" id="view-keys">
+      <div class="view-head">
+        <h2>Key 管理</h2>
+        <p class="view-desc">每把 Key 用一个 <code>uuid</code> 标识，同渠道内密钥不可重复。明文永不落盘。</p>
+      </div>
+
+      <div class="channel-cards" id="channelCards"></div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h3 id="keyPanelTitle">Key 列表</h3>
+          <div class="panel-actions">
+            <select id="keyFilterChannel" class="input input-sm"></select>
+            <button id="btnAddKey" class="btn btn-primary" type="button">+ 加 Key</button>
+            <button id="btnBulkKey" class="btn" type="button">批量导入</button>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table class="table" id="keyTable">
+            <thead>
+              <tr>
+                <th>uuid</th><th>名称</th><th>渠道</th><th>优先级</th><th>权重</th>
+                <th>运行状态</th><th>启用</th><th>最后测活</th><th class="col-actions">操作</th>
+              </tr>
+            </thead>
+            <tbody id="keyTbody"></tbody>
+          </table>
+        </div>
+        <div class="policy-hint" id="keyPolicyHint" hidden></div>
+        <div class="empty" id="keyEmpty" hidden>还没有 Key。点右上角「+ 加 Key」添加。</div>
+      </div>
+    </section>
+
+    <!-- 视图：模型 -->
+    <section class="view" id="view-aliases">
+      <div class="view-head">
+        <h2>模型</h2>
+        <p class="view-desc">
+          下游能用到哪些模型，<strong>取决于上游实际有什么</strong>。点「拉取全部渠道模型」把真实清单取回来落库，下游
+          <code>/v1/models</code> 立刻全部可见。下面的「额外映射」是<strong>可选的改名层</strong>，不建也不影响调用。
+        </p>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h3>下游可用模型</h3>
+          <div class="panel-actions">
+            <button id="btnFetchAllModels" class="btn btn-primary" type="button">拉取全部渠道模型</button>
+            <button id="btnAddAlias" class="btn" type="button">+ 新建映射</button>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table class="table">
+            <thead>
+              <tr><th>模型名</th><th>来源</th><th>渠道</th><th class="col-actions">操作</th></tr>
+            </thead>
+            <tbody id="downstreamTbody"></tbody>
+          </table>
+        </div>
+        <div class="empty" id="downstreamEmpty" hidden>
+          还没有任何模型。先到「渠道」页确认 Key 已添加，再点上面的「拉取全部渠道模型」。
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h3>上游模型目录</h3>
+          <div class="panel-actions">
+            <button id="btnClearCatalog" class="btn btn-danger" type="button">清空目录</button>
+          </div>
+        </div>
+        <div class="panel-body" id="catalogBody"></div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h3>额外映射（改名）</h3>
+          <span class="muted" style="font-size:12px">可选 —— 例如把上游 <code>glm-5.2</code> 暴露成下游的 <code>gpt-4o</code></span>
+        </div>
+        <div class="table-wrap">
+          <table class="table">
+            <thead>
+              <tr><th>对外名</th><th>上游名</th><th>渠道</th><th>优先级</th><th>状态</th><th class="col-actions">操作</th></tr>
+            </thead>
+            <tbody id="aliasTbody"></tbody>
+          </table>
+        </div>
+        <div class="empty" id="aliasEmpty" hidden>没有额外映射 —— 这是正常状态，上游模型原名已可直接调用。</div>
+      </div>
+
+      <div class="panel" id="upstreamPanel" hidden>
+        <div class="panel-head"><h3 id="upstreamTitle">上游模型清单</h3></div>
+        <div class="chips" id="upstreamChips"></div>
+      </div>
+    </section>
+
+    <!-- 视图：渠道 -->
+    <section class="view" id="view-channels">
+      <div class="view-head">
+        <h2>渠道优先级</h2>
+        <p class="view-desc">
+          一个模型被多个渠道支持时，<strong>按下面这个顺序从上往下试</strong>：
+          先把这个渠道的 Key 试完，才降级到下一个。拖动卡片即可调整。
+        </p>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h3>路由顺序</h3>
+          <div class="panel-actions">
+            <button id="btnChannelReset" class="btn btn-ghost" type="button">重置</button>
+            <button id="btnChannelSave" class="btn btn-primary" type="button" disabled>保存顺序</button>
+          </div>
+        </div>
+        <div class="panel-body">
+          <ol class="chan-list" id="chanList"></ol>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head"><h3>渠道详情</h3></div>
+        <div class="panel-body" id="chanDetail"></div>
+      </div>
+    </section>
+
+    <!-- 视图：测活 -->
+    <section class="view" id="view-probe">
+      <div class="view-head">
+        <h2>测活</h2>
+        <p class="view-desc">
+          两种模式：<strong>测整个渠道</strong>用上游 <code>GET /models</code>（廉价，不消耗对话额度）；
+          <strong>测指定模型</strong>发一条 <code>max_tokens=1</code> 的最小请求，验证真实可用性。
+        </p>
+      </div>
+
+      <div class="probe-grid">
+        <div class="panel">
+          <div class="panel-head"><h3>模式 A · 测整个渠道</h3></div>
+          <div class="panel-body">
+            <label class="field">
+              <span class="field-label">选择渠道</span>
+              <select id="probeChannel" class="input"></select>
+            </label>
+            <button id="btnProbeChannel" class="btn btn-primary btn-block" type="button">开始测活</button>
+          </div>
+        </div>
+        <div class="panel">
+          <div class="panel-head"><h3>模式 B · 测指定模型</h3></div>
+          <div class="panel-body">
+            <label class="field">
+              <span class="field-label">模型名（可填对外名）</span>
+              <input id="probeModel" class="input" placeholder="例如 gpt-4o" autocomplete="off">
+            </label>
+            <label class="field">
+              <span class="field-label">限定渠道（可选）</span>
+              <select id="probeModelChannel" class="input"></select>
+            </label>
+            <button id="btnProbeModel" class="btn btn-primary btn-block" type="button">开始测活</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel" id="probeResultPanel" hidden>
+        <div class="panel-head">
+          <h3>测活结果</h3>
+          <span class="muted" id="probeSummary"></span>
+        </div>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>渠道</th><th>Key</th><th>结果</th><th>HTTP</th><th>延迟</th><th>说明</th></tr></thead>
+            <tbody id="probeTbody"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- 视图：观测 -->
+    <section class="view" id="view-stats">
+      <div class="view-head">
+        <h2>观测</h2>
+        <p class="view-desc">渠道成功率、Key 调度状态、错误分类分布、最近请求流水。</p>
+      </div>
+
+      <div class="stat-cards" id="statCards"></div>
+
+      <div class="panel">
+        <div class="panel-head"><h3>渠道维度</h3></div>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>渠道</th><th>Key 总数</th><th>启用</th><th>请求数</th><th>成功</th><th>成功率</th><th>平均延迟</th></tr></thead>
+            <tbody id="statsChannelTbody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h3>错误分类分布</h3>
+          <span class="muted">最近 2000 条流水</span>
+        </div>
+        <div class="chips" id="errClassChips"></div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h3>调度状态明细</h3>
+          <div class="panel-actions">
+            <select id="stateFilterChannel" class="input input-sm"></select>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>渠道</th><th>Key</th><th>模型</th><th>状态</th><th>失败连击</th><th>恢复时间</th><th>最后错误</th></tr></thead>
+            <tbody id="stateTbody"></tbody>
+          </table>
+        </div>
+        <div class="empty" id="stateEmpty" hidden>暂无调度状态记录（还没发生过失败）。</div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h3>请求流水</h3>
+          <div class="panel-actions">
+            <select id="logLimit" class="input input-sm">
+              <option value="50">最近 50</option>
+              <option value="100" selected>最近 100</option>
+              <option value="300">最近 300</option>
+            </select>
+          </div>
+        </div>
+        <div class="table-wrap table-wrap-tall">
+          <table class="table">
+            <thead><tr><th>时间</th><th>模型</th><th>渠道</th><th>状态</th><th>分类</th><th>延迟</th><th>尝试</th></tr></thead>
+            <tbody id="logTbody"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- 视图：设置 -->
+    <section class="view" id="view-settings">
+      <div class="view-head">
+        <h2>设置</h2>
+        <p class="view-desc">下游 token 管理与访问方式。管理 API 也走同一套 token。</p>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head"><h3>本机登录凭据</h3></div>
+        <div class="panel-body" id="tokenInputHost"></div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h3>下游 Token</h3>
+          <button id="btnNewToken" class="btn btn-primary" type="button">+ 新建 Token</button>
+        </div>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>名称</th><th>指纹</th><th>状态</th><th>创建时间</th><th>最后使用</th><th class="col-actions">操作</th></tr></thead>
+            <tbody id="tokenTbody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head"><h3>运行参数</h3></div>
+        <div class="panel-body" id="configBody"></div>
+      </div>
+    </section>
+
+  </main>
+
+  <footer class="footer">
+    <span id="footHint">不转换协议 · 首个成功即返回</span>
+  </footer>
+</div>
+
+<!-- 对话框 -->
+<div class="modal-backdrop" id="modalBackdrop" hidden>
+  <div class="modal" role="dialog" aria-modal="true">
+    <div class="modal-head">
+      <h3 id="modalTitle">标题</h3>
+      <button id="modalClose" class="icon-btn" type="button" aria-label="关闭">×</button>
+    </div>
+    <div class="modal-body" id="modalBody"></div>
+    <div class="modal-foot">
+      <button id="modalCancel" class="btn" type="button">取消</button>
+      <button id="modalOk" class="btn btn-primary" type="button">确定</button>
+    </div>
+  </div>
+</div>
+
+<div class="toasts" id="toasts"></div>
+
+<script type="module" src="/js/app.js"></script>
+</body>
+</html>

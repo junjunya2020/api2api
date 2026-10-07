@@ -1,0 +1,8 @@
+# 统一换行符为 LF（本项目部署在 Linux，避免 CRLF 污染）
+* text=auto eol=lf
+
+# 明确二进制
+*.png binary
+*.jpg binary
+*.db binary
+*.key binary

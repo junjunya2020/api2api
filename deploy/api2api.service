@@ -1,0 +1,35 @@
+[Unit]
+Description=api2api - 多渠道 Key 聚合路由服务
+Documentation=https://github.com/junjunya2020/api2api
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/api2api
+Environment=NODE_ENV=production
+Environment=PORT=3210
+Environment=HOST=127.0.0.1
+Environment=LOG_LEVEL=info
+# 如需在 systemd 里直接指定主密钥（不推荐，优先用 data/master.key）：
+# Environment=MASTER_KEY=<64位hex>
+ExecStart=/usr/bin/node --no-warnings /opt/api2api/server.mjs
+
+Restart=always
+RestartSec=3
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+# 219 只剩约 1.6G 可用内存，给服务戴笼头
+MemoryMax=256M
+MemoryHigh=192M
+
+# 只监听 127.0.0.1，无需额外防火墙规则；这里做基础加固
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/opt/api2api/data
+
+[Install]
+WantedBy=multi-user.target

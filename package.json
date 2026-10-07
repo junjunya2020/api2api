@@ -1,0 +1,14 @@
+{
+  "name": "api2api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "多渠道 x 多 Key 聚合路由服务：原样透传 + 错误码识别 + 跨渠道降级",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "scripts": {
+    "start": "node --no-warnings server.mjs",
+    "test": "node --no-warnings --test test/"
+  }
+}
