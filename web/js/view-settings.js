@@ -9,6 +9,7 @@ export async function loadSettings() {
   renderRunConfig();
   if (!getToken()) {
     renderTokens([]);
+    renderSwitch(null);
     return;
   }
   try {
@@ -17,6 +18,65 @@ export async function loadSettings() {
   } catch (e) {
     toast(e.message, 'err');
   }
+  try {
+    const s = await api.settings();
+    renderSwitch(s);
+  } catch (e) {
+    renderSwitch(null);
+  }
+}
+
+/**
+ * ⭐「只接快速模型」开关（用户 2026-10-07 要求，**默认打开**）。
+ *
+ * 语义：对目录严重虚胖的渠道（NVIDIA NIM：80 个模型里真能用的个位数，
+ * 其余 404/410/挂死），只收录**实测可用且快**的模型。
+ * 改了**立即生效**（无需重启）—— 落盘 meta 表。
+ */
+function renderSwitch(res) {
+  const host = $('#settingsBody');
+  if (!host) return;
+
+  if (!res) {
+    host.replaceChildren(el('div', { class: 'muted', text: '登录后可见' }));
+    return;
+  }
+
+  const on = !!res.settings?.fastModelsOnly;
+  const label = el('div', { style: 'font-weight:500;margin-bottom:4px', text: '只接快速模型' });
+  const hint = el('div', {
+    class: 'field-hint',
+    text: '对目录严重虚胖的渠道（如 NVIDIA：80 个模型里真能用的个位数，其余 404/410/挂死），'
+      + '拉取目录时只收录实测可用的快速模型。默认打开。',
+  });
+
+  const toggle = el('button', {
+    class: on ? 'btn btn-primary' : 'btn',
+    type: 'button',
+    text: on ? '已开启' : '已关闭',
+    onclick: async () => {
+      try {
+        const r = await api.patchSettings({ fastModelsOnly: !on });
+        toast(r.fastModelsOnly ? '已开启：只接快速模型' : '已关闭：收录该渠道全部模型', 'ok');
+        await loadSettings();
+      } catch (e) { toast(e.message, 'err'); }
+    },
+  });
+
+  const info = el('div', { style: 'margin-top:10px' });
+  const chs = res.fast?.channels || [];
+  const models = res.fast?.models || [];
+  if (chs.length) {
+    info.replaceChildren(
+      el('div', { class: 'muted', style: 'font-size:12.5px', text: `快速渠道：${chs.join('、')}` }),
+      el('pre', { class: 'codeblock', text: models.join('\n') }),
+    );
+  }
+
+  host.replaceChildren(el('div', { style: 'display:flex;justify-content:space-between;align-items:flex-start;gap:16px' }, [
+    el('div', { style: 'flex:1' }, [label, hint, info]),
+    toggle,
+  ]));
 }
 
 function renderTokenInput() {

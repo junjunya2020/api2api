@@ -6,6 +6,9 @@ import { ErrClass } from '../util/errors.mjs';
 import sensenova from './sensenova.mjs';
 import intern from './intern.mjs';
 import openrouter from './openrouter.mjs';
+import nvidia from './nvidia.mjs';
+import modelscope from './modelscope.mjs';
+import llm7 from './llm7.mjs';
 
 /** 通用 OpenAI 兼容渠道（错误壳标准） */
 class OpenAICompatAdapter extends BaseAdapter {
@@ -37,6 +40,9 @@ const registry = new Map([
   [sensenova.id, sensenova],
   [intern.id, intern],
   [openrouter.id, openrouter],
+  [nvidia.id, nvidia],
+  [modelscope.id, modelscope],
+  [llm7.id, llm7],
   [openaiCompat.id, openaiCompat],
 ]);
 
@@ -49,4 +55,4 @@ export function adapterIds() {
   return [...registry.keys()];
 }
 
-export default { getAdapter, adapterIds, openaiCompat, openrouter };
+export default { getAdapter, adapterIds, openaiCompat, openrouter, nvidia, modelscope, llm7 };

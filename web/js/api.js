@@ -55,6 +55,10 @@ export const api = {
   reorderChannels: (order) => request('POST', '/api/channels/reorder', { order }),
   patchChannel: (id, patch) => request('PATCH', `/api/channels/${encodeURIComponent(id)}`, patch),
 
+  // 运行设置（控制台可切，立即生效）
+  settings: () => request('GET', '/api/settings'),
+  patchSettings: (patch) => request('PATCH', '/api/settings', patch),
+
   // Key
   listKeys: (channel) => request('GET', `/api/keys${channel ? `?channel=${encodeURIComponent(channel)}` : ''}`),
   getKey: (uuid) => request('GET', `/api/keys/${encodeURIComponent(uuid)}`),

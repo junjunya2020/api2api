@@ -189,6 +189,25 @@ export const config = {
    */
   modelDisabledRecoverMs: int('MODEL_DISABLED_RECOVER_MS', 24 * 3600_000),
 
+  /**
+   * ⭐ 「只接快速模型」总开关（用户 2026-10-07 要求，**默认打开**）。
+   *
+   * 语义：对**目录严重虚胖**的渠道（目前只有 NVIDIA NIM —— 80 个模型里
+   * 真能用的个位数，其余 404/410/挂死），拉目录时只收录**实测可用的快速模型**。
+   *
+   * 运行时可在控制台 / `/api/settings` 里切换，落盘 `data/settings.json`（见 settings.mjs），
+   * 优先级：**settings.json > env > 本默认值**。
+   *
+   * 设 0 = 收录该渠道全部模型（谨慎：挂死模型会烧熔断预算）。
+   */
+  fastModelsOnly: int('FAST_MODELS_ONLY', 1),
+
+  /**
+   * 快速模型名单的**临时覆盖**（逗号分隔上游模型名）。
+   * 留空 = 用 `src/db/fast-models.mjs` 的内置实测表。
+   */
+  fastModels: pick('FAST_MODELS', ''),
+
   /** 请求体大小上限 */
   maxBodyBytes: int('MAX_BODY_BYTES', 8 * 1024 * 1024),
 

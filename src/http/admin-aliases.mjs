@@ -16,6 +16,8 @@ import { getChannel, listChannels } from '../db/channels.mjs';
 import { listKeys, getKeySecret } from '../db/keys.mjs';
 import { getAdapter } from '../adapters/index.mjs';
 import { ErrClass } from '../util/errors.mjs';
+import { fastModelsOnly } from '../db/settings.mjs';
+import { isFastOnlyChannel, filterFastModels, fastModelsOf } from '../db/fast-models.mjs';
 import { readJson, sendJson, matchPath, HttpError } from './util.mjs';
 import config from '../config.mjs';
 import log from '../util/log.mjs';
@@ -141,8 +143,19 @@ export async function handleAliases(req, res, url) {
       // 混合渠道（如 OpenRouter：465 个里只有 16 个免费）默认只收免费模型。
       // 付费模型放进目录会让下游清单被淹没，且误调用会真实扣费。
       const upstreamTotal = Array.isArray(json?.data) ? json.data.length : 0;
-      const ids = adapter.parseModels(json);
+      let ids = adapter.parseModels(json);
       const freeFiltered = upstreamTotal > ids.length;
+
+      // ⭐「只接快速模型」——对目录严重虚胖的渠道（NVIDIA：80 个里真能用个位数），
+      //   默认只收录**实测可用且快**的那几个。开关默认打开，可在设置页关闭。
+      let fastFiltered = false;
+      if (fastModelsOnly() && isFastOnlyChannel(ch.name)) {
+        const before = ids.length;
+        ids = filterFastModels(ch.name, ids);
+        fastFiltered = before !== ids.length;
+        log.info(`[models/fetch] ${ch.name} 只接快速模型：${before} → ${ids.length}`
+          + `（白名单 ${fastModelsOf(ch.name).length} 个）`);
+      }
 
       // 落库：上游有什么，下游就能看到什么
       const saved = catalog.replaceChannelModels(ch.id, ids);
@@ -157,7 +170,7 @@ export async function handleAliases(req, res, url) {
 
       return sendJson(res, 200, {
         ok: true, channel: ch.name, channelDisplay: ch.display_name,
-        count: ids.length, saved, upstreamTotal, freeFiltered,
+        count: ids.length, saved, upstreamTotal, freeFiltered, fastFiltered,
         autoAliases: auto.created,
         models: ids,
         downstreamTotal: aliases.publicModelList().length,

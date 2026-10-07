@@ -66,17 +66,26 @@ console.log('\n=== api2api 冒烟测试 ===\n');
 getDb();
 
 console.log('[1] 内置渠道');
-t('预置了三个渠道', () => {
+t('预置了六个渠道', () => {
   const list = channels.listChannels();
-  assert.strictEqual(list.length, 3, `期望 3 个，实际 ${list.length}`);
+  assert.strictEqual(list.length, 6, `期望 6 个，实际 ${list.length}`);
   const names = list.map((c) => c.name).sort();
-  assert.deepStrictEqual(names, ['intern', 'openrouter', 'sensenova']);
+  assert.deepStrictEqual(names, ['intern', 'llm7', 'modelscope', 'nvidia', 'openrouter', 'sensenova']);
 });
 t('渠道 base_url 正确', () => {
   const s = channels.getChannel('sensenova');
   assert.strictEqual(s.base_url, 'https://token.sensenova.cn/v1');
   const i = channels.getChannel('intern');
   assert.strictEqual(i.base_url, 'https://discovery-api.intern-ai.org.cn/v1');
+  const n = channels.getChannel('nvidia');
+  assert.strictEqual(n.base_url, 'https://integrate.api.nvidia.com/v1');
+  assert.strictEqual(n.adapter, 'nvidia');
+  const m = channels.getChannel('modelscope');
+  assert.strictEqual(m.base_url, 'https://api-inference.modelscope.cn/v1');
+  assert.strictEqual(m.adapter, 'modelscope');
+  const l = channels.getChannel('llm7');
+  assert.strictEqual(l.base_url, 'https://api.llm7.io/v1');
+  assert.strictEqual(l.adapter, 'llm7');
 });
 
 console.log('\n[2] 加密与指纹');
@@ -1503,6 +1512,169 @@ t('★ modelChannelRates 分解错误分类（看得出"就是爱 429"）', () =
   const hit = rows.find((x) => x.upstream_model === 'rate-model');
   assert.ok(hit, '应能找到该模型');
   assert.strictEqual(hit.quota_fail, 2, '应统计出 2 次 quota 失败');
+});
+
+console.log('\n[10] NVIDIA NIM 渠道 + 「只接快速模型」开关');
+
+const nvidia = (await import('../src/adapters/nvidia.mjs')).default;
+const fast = await import('../src/db/fast-models.mjs');
+const settings = await import('../src/db/settings.mjs');
+const adapterIndex = await import('../src/adapters/index.mjs');
+
+t('NVIDIA 适配器已注册，base_url 正确', () => {
+  assert.ok(adapterIndex.adapterIds().includes('nvidia'), 'nvidia 应在注册表里');
+  assert.strictEqual(channels.getChannel('nvidia').base_url, 'https://integrate.api.nvidia.com/v1');
+});
+
+t('NVIDIA 401 → AUTH（标准 error 壳）', () => {
+  const v = nvidia.classify(401, {}, JSON.stringify({ error: { message: 'Invalid API key.', type: 'AuthError' } }));
+  assert.strictEqual(v.errClass, ErrClass.AUTH, `实际 ${v.errClass}`);
+});
+
+t('NVIDIA 429 → QUOTA', () => {
+  const v = nvidia.classify(429, {}, JSON.stringify({ error: { message: 'Rate limit exceeded', type: 'RateLimitError' } }));
+  assert.strictEqual(v.errClass, ErrClass.QUOTA, `实际 ${v.errClass}`);
+});
+
+t('NVIDIA 顶层 404（无 error 壳）→ CONFIG_FAULT', () => {
+  // 实测形态：目录里有、本账号没订阅 → {"status":404,"title":"Not Found","detail":"Function ..."}
+  const v = nvidia.classify(404, {}, JSON.stringify({ status: 404, title: 'Not Found', detail: "Function 'x' Not found for account" }));
+  assert.strictEqual(v.errClass, ErrClass.CONFIG_FAULT, `实际 ${v.errClass}`);
+});
+
+t('NVIDIA 410 Gone（模型退役）→ CONFIG_FAULT', () => {
+  const v = nvidia.classify(410, {}, JSON.stringify({ type: 'about:blank', title: 'Gone', status: 410, detail: "The model 'x' has reached its end of life" }));
+  assert.strictEqual(v.errClass, ErrClass.CONFIG_FAULT, `实际 ${v.errClass}`);
+});
+
+t('★ 快速模型白名单：只含实测可用且快的（排除挂死/退役）', () => {
+  const list = fast.fastModelsOf('nvidia');
+  assert.ok(list.includes('nvidia/nemotron-3-super-120b-a12b'), '最稳的 super 应在白名单');
+  assert.ok(!list.includes('z-ai/glm-5.3'), '挂死的 glm-5.3 不该在');
+  assert.ok(!list.includes('moonshotai/kimi-k3'), '挂死的 kimi-k3 不该在');
+  assert.ok(!list.includes('deepseek-ai/deepseek-v4.1-flash'), '挂死的 deepseek 不该在');
+});
+
+t('★ filterFastModels 只放行白名单内的', () => {
+  const out = fast.filterFastModels('nvidia', [
+    'nvidia/nemotron-3-super-120b-a12b', 'z-ai/glm-5.3', 'openai/gpt-oss-20b',
+  ]);
+  assert.deepStrictEqual(out, ['nvidia/nemotron-3-super-120b-a12b', 'openai/gpt-oss-20b']);
+});
+
+t('★ 非快速渠道不过滤（商汤/书生原样放行）', () => {
+  const ids = ['glm-5.2', 'SenseChat-5-0903'];
+  assert.deepStrictEqual(fast.filterFastModels('sensenova', ids), ids);
+  assert.strictEqual(fast.isFastModel('sensenova', 'anything'), true);
+});
+
+t('★ 开关默认打开（出厂值）', () => {
+  assert.strictEqual(settings.fastModelsOnly(), true, '默认应为「只接快速模型」');
+  assert.strictEqual(settings.allSettings().fastModelsOnlyDefault, true);
+});
+
+t('★ 开关可切换并持久化', () => {
+  settings.setFastModelsOnly(false);
+  assert.strictEqual(settings.fastModelsOnly(), false);
+  settings.setFastModelsOnly(true);
+  assert.strictEqual(settings.fastModelsOnly(), true);
+});
+
+console.log('\n[11] 魔搭 ModelScope 渠道');
+
+const msAdapter = (await import('../src/adapters/modelscope.mjs')).default;
+
+t('ModelScope 适配器已注册，base_url 正确', () => {
+  assert.ok(adapterIndex.adapterIds().includes('modelscope'), 'modelscope 应在注册表里');
+  assert.strictEqual(channels.getChannel('modelscope').base_url, 'https://api-inference.modelscope.cn/v1');
+});
+
+t('ModelScope 未绑阿里云账号（401）→ AUTH（不是 CONFIG_FAULT）', () => {
+  // 实测形态：token 能列模型，但 chat 被账号门挡住
+  const v = msAdapter.classify(401, {}, JSON.stringify({
+    error: { message: 'Please bind your Alibaba Cloud account before use.' },
+    request_id: '3f854604-db29-48d9-9b4b-930dcb08079b',
+  }));
+  assert.strictEqual(v.errClass, ErrClass.AUTH, `实际 ${v.errClass}`);
+  assert.strictEqual(v.traceId, '3f854604-db29-48d9-9b4b-930dcb08079b', '应解析顶层 request_id');
+});
+
+t('ModelScope 无效 token（401）→ AUTH', () => {
+  const v = msAdapter.classify(401, {}, JSON.stringify({
+    error: { message: 'Authentication failed, please make sure that a valid ModelScope token is supplied.' },
+    request_id: 'req_x',
+  }));
+  assert.strictEqual(v.errClass, ErrClass.AUTH, `实际 ${v.errClass}`);
+});
+
+t('ModelScope 429 → QUOTA', () => {
+  const v = msAdapter.classify(429, {}, JSON.stringify({
+    error: { message: 'Too many requests, rate limit exceeded for this model.' }, request_id: 'r',
+  }));
+  assert.strictEqual(v.errClass, ErrClass.QUOTA, `实际 ${v.errClass}`);
+});
+
+t('ModelScope 模型不存在 → CONFIG_FAULT', () => {
+  const v = msAdapter.classify(404, {}, JSON.stringify({
+    error: { message: "The model 'x/y' does not exist." }, request_id: 'r',
+  }));
+  assert.strictEqual(v.errClass, ErrClass.CONFIG_FAULT, `实际 ${v.errClass}`);
+});
+
+t('★ ModelScope 不在「快速模型」过滤范围内（目录本身可用）', () => {
+  assert.strictEqual(fast.isFastOnlyChannel('modelscope'), false);
+  const ids = ['Qwen/Qwen3.5-35B-A3B', 'deepseek-ai/DeepSeek-V4-Pro'];
+  assert.deepStrictEqual(fast.filterFastModels('modelscope', ids), ids);
+});
+
+console.log('\n[12] LLM7.io 渠道');
+
+const llm7Adapter = (await import('../src/adapters/llm7.mjs')).default;
+
+t('LLM7 适配器已注册，base_url 正确', () => {
+  assert.ok(adapterIndex.adapterIds().includes('llm7'), 'llm7 应在注册表里');
+  assert.strictEqual(channels.getChannel('llm7').base_url, 'https://api.llm7.io/v1');
+});
+
+t('★ LLM7 402 insufficient_balance → CONFIG_FAULT（付费档模型，跳过渠道，不罚 Key）', () => {
+  // ⚠️ 这是关键：通用 openai_compat 会因文本含 insufficient 归成 QUOTA → 错误地冷却 Key + 反复重试
+  const v = llm7Adapter.classify(402, {}, JSON.stringify({
+    error: { message: 'Insufficient balance. Please top up your balance to continue.',
+      type: 'insufficient_quota', code: 'insufficient_balance' },
+  }));
+  assert.strictEqual(v.errClass, ErrClass.CONFIG_FAULT, `实际 ${v.errClass}`);
+});
+
+t('★ LLM7 402 pro_access_required → CONFIG_FAULT', () => {
+  const v = llm7Adapter.classify(402, {}, JSON.stringify({
+    error: { message: 'Pro models require balance or an active subscription.', code: 'pro_access_required' },
+  }));
+  assert.strictEqual(v.errClass, ErrClass.CONFIG_FAULT, `实际 ${v.errClass}`);
+});
+
+t('LLM7 429 rate_limit_exceeded → QUOTA（带 retry_after）', () => {
+  const v = llm7Adapter.classify(429, {}, JSON.stringify({
+    error: { message: 'Rate limit exceeded. Retry after 919 seconds.', code: 'rate_limit_exceeded', retry_after: 919 },
+  }));
+  assert.strictEqual(v.errClass, ErrClass.QUOTA, `实际 ${v.errClass}`);
+});
+
+t('LLM7 400 model_unavailable → CONFIG_FAULT（目录里有、当前下线）', () => {
+  const v = llm7Adapter.classify(400, {}, JSON.stringify({
+    error: { message: "Model 'glm-5.3-flash' is currently unavailable.", code: 'model_unavailable' },
+  }));
+  assert.strictEqual(v.errClass, ErrClass.CONFIG_FAULT, `实际 ${v.errClass}`);
+});
+
+t('LLM7 无效 key（401）→ AUTH', () => {
+  const v = llm7Adapter.classify(401, {}, JSON.stringify({
+    error: { message: 'Your API key is invalid, expired, or revoked.', type: 'invalid_request_error' },
+  }));
+  assert.strictEqual(v.errClass, ErrClass.AUTH, `实际 ${v.errClass}`);
+});
+
+t('★ LLM7 也不在「快速模型」过滤范围内（免费档模型本就少）', () => {
+  assert.strictEqual(fast.isFastOnlyChannel('llm7'), false);
 });
 
 closeDb();

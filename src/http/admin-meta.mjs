@@ -17,9 +17,11 @@ import * as channels from '../db/channels.mjs';
 import * as tokens from '../db/tokens.mjs';
 import * as logs from '../db/logs.mjs';
 import * as state from '../db/state.mjs';
+import * as settings from '../db/settings.mjs';
 import { keyStats } from '../db/keys.mjs';
 import { publicModelList } from '../db/aliases.mjs';
 import { adapterIds } from '../adapters/index.mjs';
+import { FAST_ONLY_CHANNELS, fastModelsOf } from '../db/fast-models.mjs';
 import { readJson, sendJson, matchPath, HttpError } from './util.mjs';
 import config from '../config.mjs';
 
@@ -33,6 +35,26 @@ export async function handleMeta(req, res, url) {
       channels: channels.publicChannelBrief(),
       builtinAdapters: adapterIds(),
     });
+  }
+
+  // ---- 运行设置（用户可在控制台切换，立即生效）----
+  if (pathname === '/api/settings' && method === 'GET') {
+    return sendJson(res, 200, {
+      settings: settings.allSettings(),
+      /** 说明「快速模型」白名单现状 */
+      fast: {
+        channels: [...FAST_ONLY_CHANNELS],
+        models: [...FAST_ONLY_CHANNELS].flatMap((ch) => fastModelsOf(ch)),
+      },
+    });
+  }
+  if (pathname === '/api/settings' && method === 'PATCH') {
+    const body = await readJson(req);
+    if (body && body.fastModelsOnly !== undefined) {
+      const next = settings.setFastModelsOnly(!!body.fastModelsOnly);
+      return sendJson(res, 200, { ok: true, settings: settings.allSettings(), fastModelsOnly: next });
+    }
+    throw new HttpError(400, '没有可更新的字段（支持 fastModelsOnly）');
   }
 
   // 渠道优先级整体重排：前端拖拽后一次性提交完整顺序。

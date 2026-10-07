@@ -684,6 +684,11 @@ await ta('未拉过目录的渠道不会被误跳过（未知 ≠ 没有）', as
   // 这里把 openrouter 停用（它在本测试里指向真实上游，不该被打），
   // 并把商汤/书生目录都设成"不含 degrade-test"，
   // 于是所有候选都是"目录确认没有" → 必须回退成全试，拿到真实结果而不是凭空 503。
+  //
+  // ⚠️ 回归防线（2026-10-08）：新增内置渠道（modelscope，尚未配 Key）后本用例曾失败 ——
+  //    一个**没配任何 Key** 的渠道会赖在候选里（它是"未知"），
+  //    使「全都确认没有 → 回退全试」的兜底失效 → 请求被凭空 503。
+  //    修法：relay 预先剔除 enabledKeyCount==0 的渠道。本用例即该修复的回归锁。
   channelsDb.updateChannel(channelsDb.getChannel('openrouter').id, { enabled: false });
   snBehavior.calls.length = 0;
   itBehavior.calls.length = 0;

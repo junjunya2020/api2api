@@ -213,4 +213,35 @@ export const BUILTIN_CHANNELS = [
     sort_order: 30,
     note: 'OpenRouter。拉取时**只保留免费模型**（pricing 全 0），避免下游被几百个付费模型淹没、误调用扣费。',
   },
+  {
+    name: 'nvidia',
+    display_name: 'NVIDIA NIM',
+    adapter: 'nvidia',
+    base_url: 'https://integrate.api.nvidia.com/v1',
+    default_model: 'nvidia/nemotron-3-super-120b-a12b',
+    sort_order: 40,
+    note: 'NVIDIA build.nvidia.com 免费档（~40 RPM，账号级）。内置「只接快速模型」过滤：'
+      + '目录 80 个里真能用且快的只有个位数，默认只收录实测通过的那几个。',
+  },
+  {
+    name: 'modelscope',
+    display_name: '魔搭 ModelScope',
+    adapter: 'modelscope',
+    base_url: 'https://api-inference.modelscope.cn/v1',
+    default_model: 'Qwen/Qwen3.5-35B-A3B',
+    sort_order: 50,
+    note: '阿里魔搭 ModelScope API-Inference 免费档（2000 次/天，单模型 ≤500）。'
+      + '⚠️ 需先在 ModelScope 绑定阿里云账号，否则任何 chat 调用返回 401 '
+      + '「Please bind your Alibaba Cloud account before use.」。',
+  },
+  {
+    name: 'llm7',
+    display_name: 'LLM7.io',
+    adapter: 'llm7',
+    base_url: 'https://api.llm7.io/v1',
+    default_model: 'deepseek-v4-pro',
+    sort_order: 60,
+    note: 'LLM7.io 免费聚合网关（keyless 也可用，Bearer 随便填；注册 token 限额更高）。'
+      + '目录 66 个但免费档只有少数可用；付费档模型返回 402 → 适配器归 CONFIG_FAULT（跳过）。',
+  },
 ];

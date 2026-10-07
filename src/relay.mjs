@@ -22,6 +22,8 @@ import {
 import * as rate from './scheduler/rate.mjs';
 import { ErrClass, ApiError, classifyByStatus } from './util/errors.mjs';
 import { logRequest } from './db/logs.mjs';
+import { fastModelsOnly } from './db/settings.mjs';
+import { isFastOnlyChannel, isFastModel } from './db/fast-models.mjs';
 import config from './config.mjs';
 import log from './util/log.mjs';
 
@@ -72,6 +74,50 @@ export async function relay({ publicModel, rawBody, pathTail = 'chat/completions
   // 这里再按渠道优先级稳定分组，保证同渠道的候选聚在一起、按渠道顺序推进。
   const sorted = orderByChannelPriority(candidates);
 
+  // ⭐ 预先剔掉**一把启用 Key 都没有**的渠道（2026-10-08）。
+  //
+  // 为什么必须在最前：一个从未配置 Key 的渠道（比如刚内置、还没绑 Key 的 modelscope）
+  // 会以 rank 3/catalogKnown=false（= "未知 ≠ 没有"）的身份**赖在候选里**，
+  // 从而让下面「目录全都确认没有 → 回退全试」的兜底判定失效 ——
+  // 因为它让 filtered 非空，ordered0 不再回退，请求被凭空 503。
+  // 而它实际上一把 Key 都没有，根本不可能服务这个请求，留着只会占位。
+  //
+  // ⚠️ 必须用 `enabledKeyCount > 0` 而不是 `availableKeyCount > 0`：
+  //    Key 全在冷却/禁用（但池子非空）的渠道要保留 —— 那种情况该返回 429/503，
+  //    而不是被当成"不存在"而跳过（那会误报 404）。
+  const withKeys = sorted.filter((c) => c.channelId && enabledKeyCount(c.channelId) > 0);
+  const noKeyChannels = sorted.length - withKeys.length;
+  if (noKeyChannels > 0) {
+    log.debug(`[relay] 跳过 ${noKeyChannels} 个未配置任何 Key 的渠道`);
+  }
+  const candidates0 = withKeys.length ? withKeys : sorted;
+
+  // ⭐「只接快速模型」运行时闸门（用户 2026-10-07）—— **必须先于目录"确定没有"判定**。
+  //   拉目录时已过滤，这里再兜一层：若目录还是老的（残留慢模型），也**不能把请求
+  //   打到"永不返回"的模型上**（NVIDIA 目录 80 个里多数是挂死的）。
+  //   只影响「快速渠道」（目前 nvidia）；商汤/书生/OpenRouter 原样放行。
+  //
+  //   ⚠️ 顺序很重要：如果放在下面那步**之后**，会把"目录全确认没有 → 回退全试"
+  //      的兜底挡掉，导致本该真打一次上游的请求被凭空 404。
+  let pre = candidates0;
+  if (fastModelsOnly()) {
+    pre = candidates0.filter(
+      (c) => !(isFastOnlyChannel(c.channelName) && !isFastModel(c.channelName, c.upstreamName)),
+    );
+    // 全部候选都被"快速白名单"挡掉 → 明确拒绝，而不是退回去打挂死模型
+    if (!pre.length && candidates0.length) {
+      logRequest({
+        model: null, publicModel, channelId: null, keyUuid: null,
+        status: 404, errClass: ErrClass.CONFIG_FAULT, upstreamTrace: null,
+        latencyMs: null, attempts: 0, chain: null,
+      });
+      throw new ApiError(404, `模型 "${publicModel}" 不在「快速模型」白名单内（可在设置页关闭该开关）`, {
+        code: 'model_not_found', type: 'invalid_request_error',
+        errClass: ErrClass.CONFIG_FAULT, logged: true,
+      });
+    }
+  }
+
   // 目录信息可用时，**明确"拉过目录且没有这个模型"的渠道（rank 3 且 catalogKnown）不必真去打上游** ——
   // 铁定 404，只是白耗一次真实请求 + 一轮超时。
   //
@@ -83,11 +129,11 @@ export async function relay({ publicModel, rawBody, pathTail = 'chat/completions
   // 实例（真 Key 实测）：`gemma-4-31b-it` 只在 OpenRouter，商汤/书生目录里都没有
   //   → 跳过这两家，直接打 OpenRouter，省掉两次必败的上游请求。
   const isDefinitelyAbsent = (c) => (c.rank ?? 3) === 3 && c.catalogKnown === true;
-  const filtered = sorted.filter((c) => !isDefinitelyAbsent(c));
+  const filtered = pre.filter((c) => !isDefinitelyAbsent(c));
   // 兜底：全都"确定没有"时不能直接放弃 —— 目录可能过期（上游刚上新模型），
   // 宁可多打一次上游拿真实 404，也不要凭空报"没有渠道可用"。
-  const ordered0 = filtered.length ? filtered : sorted;
-  const skippedByCatalog = sorted.length - ordered0.length;
+  const ordered0 = filtered.length ? filtered : pre;
+  const skippedByCatalog = pre.length - ordered0.length;
   if (skippedByCatalog > 0) {
     log.debug(`[relay] 按上游目录跳过 ${skippedByCatalog} 个确认没有该模型的渠道`);
   }
