@@ -9,17 +9,175 @@ import {
 } from './ui.js';
 
 export async function loadStats() {
-  const [s, st, lg] = await Promise.all([
+  const [s, st, lg, mh, rates] = await Promise.all([
     api.stats(),
     api.states($('#stateFilterChannel')?.value || undefined),
     api.logs(Number($('#logLimit')?.value) || 100),
+    api.modelHealth({
+      channel: $('#mhFilterChannel')?.value || undefined,
+      state: $('#mhFilterState')?.value || undefined,
+    }).catch(() => ({ models: [], summary: [] })),
+    api.rates(Number($('#rateLimit')?.value) || 5000).catch(() => ({ byModel: [], byKey: [], byChannel: [] })),
   ]);
   renderStatCards(s);
+  renderModelHealth(mh);
+  renderRates(rates);
   renderChannelStats(s);
   renderErrClasses(s);
   renderStates(st);
   renderLogs(lg);
   tickCountdowns();   // 共用倒计时器（ui.js）
+}
+
+/* ============================================================
+ * ⭐ 模型健康度（正常 / 降级 / 不可用）
+ * ============================================================ */
+
+const MH_STATE = {
+  NORMAL: { label: '正常', cls: 'pill-ok' },
+  DEGRADED: { label: '降级', cls: 'pill-warn' },
+  UNAVAILABLE: { label: '不可用', cls: 'pill-err' },
+};
+
+function renderModelHealth(mh) {
+  const host = $('#mhTbody');
+  const empty = $('#mhEmpty');
+  const rows = mh?.models || [];
+
+  // 汇总条：各渠道降级 / 不可用计数
+  const sumHost = $('#mhSummary');
+  if (sumHost) {
+    const sum = (mh?.summary || []).filter((x) => x.degraded || x.unavailable);
+    const r = mh?.rules || {};
+    if (!sum.length) {
+      sumHost.replaceChildren(el('span', { class: 'muted', text: '所有模型健康度正常' }));
+    } else {
+      sumHost.replaceChildren(
+        ...sum.map((x) => el('span', { class: 'chip chip-count', title: x.channel }, [
+          `${x.channelDisplay || x.channel} `,
+          x.degraded ? el('b', { class: 'chip-warn', text: `降级 ${x.degraded}` }) : null,
+          document.createTextNode(' '),
+          x.unavailable ? el('b', { class: 'chip-err', text: `不可用 ${x.unavailable}` }) : null,
+        ])),
+        el('span', {
+          class: 'muted',
+          style: 'font-size:12px;margin-left:8px',
+          text: `规则：连续失败 ${r.degradeAfterFails ?? '?'} 次降级、${r.unavailableAfterFails ?? '?'} 次不可用；`
+            + `不可用约 ${Math.round((r.recoverMs || 0) / 3600000)} 小时后降级观察`
+            + `；单渠道最多试四分之一的 Key（${r.channelCircuitFraction ?? 4} 分之一）`,
+        }),
+      );
+    }
+  }
+
+  if (!rows.length) {
+    host.replaceChildren();
+    if (empty) empty.hidden = false;
+    return;
+  }
+  if (empty) empty.hidden = true;
+
+  host.replaceChildren(...rows.map((m) => {
+    const st = MH_STATE[m.state] || { label: m.state, cls: 'pill-idle' };
+    const total = (m.totalOk || 0) + (m.totalFail || 0);
+    const rateTxt = total ? `${m.totalOk}/${total}` : '—';
+
+    // 恢复倒计时：UNAVAILABLE / DEGRADED 都有 untilAt
+    const remaining = m.remainingMs || 0;
+    const cdCell = remaining > 0
+      ? el('span', {
+        class: 'muted mono',
+        'data-countdown-until': String(m.untilAt),
+        text: fmtCountdown(remaining),
+      })
+      : el('span', { class: 'muted', text: '—' });
+
+    return el('tr', {}, [
+      el('td', {}, [el('span', { class: 'pill pill-accent', text: m.channelDisplay || m.channel })]),
+      el('td', { class: 'uuid-cell', text: m.model, title: m.model }),
+      el('td', {}, [el('span', { class: `pill ${st.cls}`, text: st.label })]),
+      el('td', { text: String(m.failStreak ?? 0) }),
+      el('td', { class: 'muted', text: rateTxt }),
+      el('td', {}, [cdCell]),
+      el('td', { class: 'muted', title: m.reason || m.lastError || '', text: (m.reason || m.lastError || '—').slice(0, 46) }),
+      el('td', { class: 'col-actions' }, [
+        el('button', {
+          class: 'btn btn-sm', type: 'button', text: '重置',
+          title: '清除该模型的熔断状态，立即恢复为正常',
+          onclick: async () => {
+            try {
+              await api.resetModelHealth(m.channel, m.model);
+              toast(`已重置 ${m.channel}/${m.model}`, 'ok');
+              await loadStats();
+            } catch (e) { toast(e.message, 'err'); }
+          },
+        }),
+      ]),
+    ]);
+  }));
+}
+
+/* ============================================================
+ * ⭐ 成功率（按模型 / Key / 渠道）
+ * ============================================================ */
+
+function renderRates(rates) {
+  const dim = $('#rateDim')?.value || 'byModel';
+  const rows = rates?.[dim] || [];
+  const thead = $('#rateThead');
+  const tbody = $('#rateTbody');
+  const empty = $('#rateEmpty');
+  if ($('#rateScope')) {
+    $('#rateScope').textContent = rates?.scope || `抽样：最近 ${rates?.sampleLimit ?? '-'} 条流水`;
+  }
+
+  if (!rows.length) {
+    thead.replaceChildren();
+    tbody.replaceChildren();
+    if (empty) empty.hidden = false;
+    return;
+  }
+  if (empty) empty.hidden = true;
+
+  /** 维度 → 首列表头 */
+  const firstCol = { byModel: '模型', byKey: 'Key', byChannel: '渠道' }[dim] || '维度';
+  thead.replaceChildren(
+    ...['', firstCol, '请求数', '成功', '失败', '成功率', '平均成功延迟']
+      .slice(1).map((h) => el('th', { text: h })),
+  );
+
+  tbody.replaceChildren(...rows.map((r) => {
+    const rate = r.rate;
+    const pct = r.ratePct == null ? '—' : `${r.ratePct}%`;
+    const cls = rate == null ? 'pill-idle' : rate >= 0.95 ? 'pill-ok' : rate >= 0.7 ? 'pill-warn' : 'pill-err';
+
+    let nameNode;
+    if (dim === 'byModel') {
+      nameNode = el('td', { class: 'uuid-cell', text: r.model || '—', title: r.model || '' });
+    } else if (dim === 'byKey') {
+      nameNode = el('td', { class: 'uuid-cell' }, [
+        el('div', { style: 'display:flex;gap:8px;align-items:center' }, [
+          el('span', { text: r.key_uuid || '—', title: r.key_uuid || '' }),
+          r.channel
+            ? el('span', { class: 'pill pill-accent', text: r.channel_display || r.channel })
+            : null,
+        ]),
+      ]);
+    } else {
+      nameNode = el('td', {}, [
+        el('span', { class: 'pill pill-accent', text: r.channel_display || r.channel || r.channel_id || '—' }),
+      ]);
+    }
+
+    return el('tr', {}, [
+      nameNode,
+      el('td', { text: String(r.req ?? 0) }),
+      el('td', { text: String(r.ok ?? 0) }),
+      el('td', { text: String(r.fail ?? 0) }),
+      el('td', {}, [el('span', { class: `pill ${cls}`, text: pct })]),
+      el('td', { class: 'muted', text: fmtMs(r.avgOkLatency ?? null) }),
+    ]);
+  }));
 }
 
 function renderStatCards(s) {
@@ -170,6 +328,18 @@ export function initStatsView() {
     loadStats().catch((e) => toast(e.message, 'err'));
   });
   $('#logLimit').addEventListener('change', () => {
+    loadStats().catch((e) => toast(e.message, 'err'));
+  });
+  $('#mhFilterChannel')?.addEventListener('change', () => {
+    loadStats().catch((e) => toast(e.message, 'err'));
+  });
+  $('#mhFilterState')?.addEventListener('change', () => {
+    loadStats().catch((e) => toast(e.message, 'err'));
+  });
+  $('#rateDim')?.addEventListener('change', () => {
+    loadStats().catch((e) => toast(e.message, 'err'));
+  });
+  $('#rateLimit')?.addEventListener('change', () => {
     loadStats().catch((e) => toast(e.message, 'err'));
   });
 }

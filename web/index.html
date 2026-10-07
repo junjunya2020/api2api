@@ -61,7 +61,7 @@
             <thead>
               <tr>
                 <th>uuid</th><th>名称</th><th>渠道</th><th>优先级</th><th>权重</th>
-                <th>运行状态</th><th>启用</th><th>最后测活</th><th class="col-actions">操作</th>
+                <th>运行状态</th><th>近期成功率</th><th>启用</th><th>最后测活</th><th class="col-actions">操作</th>
               </tr>
             </thead>
             <tbody id="keyTbody"></tbody>
@@ -223,6 +223,63 @@
       </div>
 
       <div class="stat-cards" id="statCards"></div>
+
+      <!-- ⭐ 模型健康度（正常 / 降级 / 不可用）—— 用户要求「分多级」 -->
+      <div class="panel">
+        <div class="panel-head">
+          <h3>模型健康度</h3>
+          <div class="panel-actions">
+            <select id="mhFilterChannel" class="input input-sm"></select>
+            <select id="mhFilterState" class="input input-sm">
+              <option value="">全部状态</option>
+              <option value="DEGRADED">仅降级</option>
+              <option value="UNAVAILABLE">仅不可用</option>
+            </select>
+          </div>
+        </div>
+        <div class="panel-body" id="mhSummary"></div>
+        <div class="table-wrap">
+          <table class="table">
+            <thead>
+              <tr><th>渠道</th><th>模型</th><th>健康度</th><th>连续失败</th><th>成功/失败</th><th>恢复倒计时</th><th>原因</th><th class="col-actions">操作</th></tr>
+            </thead>
+            <tbody id="mhTbody"></tbody>
+          </table>
+        </div>
+        <div class="empty" id="mhEmpty" hidden>还没有模型健康度记录 —— 说明没有模型连续失败过。</div>
+      </div>
+
+      <!-- ⭐ 成功率（按模型 / Key / 渠道）—— 用户要求「统计一下成功率」 -->
+      <div class="panel">
+        <div class="panel-head">
+          <h3>成功率</h3>
+          <div class="panel-actions">
+            <select id="rateDim" class="input input-sm">
+              <option value="byModel" selected>按模型</option>
+              <option value="byKey">按 Key</option>
+              <option value="byChannel">按渠道</option>
+            </select>
+            <select id="rateLimit" class="input input-sm">
+              <option value="1000">最近 1000 条</option>
+              <option value="5000" selected>最近 5000 条</option>
+              <option value="20000">最近 20000 条</option>
+            </select>
+          </div>
+        </div>
+        <div class="panel-body">
+          <p class="muted" style="margin:0 0 10px;font-size:12px">
+            口径：<strong>一次下游请求最终是否成功</strong>（不是每次上游尝试）。
+            <span id="rateScope"></span>
+          </p>
+        </div>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr id="rateThead"></tr></thead>
+            <tbody id="rateTbody"></tbody>
+          </table>
+        </div>
+        <div class="empty" id="rateEmpty" hidden>还没有请求流水。</div>
+      </div>
 
       <div class="panel">
         <div class="panel-head"><h3>渠道维度</h3></div>

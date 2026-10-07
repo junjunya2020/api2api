@@ -82,8 +82,11 @@ export function recordSuccess(keyUuid, model) {
 /**
  * 记录失败。
  *
- * @param action     'cooldown' | 'disable' | 'none'
- * @param nextRetryAt 冷却到期时间戳（action='cooldown' 时有效）
+ * @param action     'cooldown' | 'soft' | 'disable' | 'none'
+ *                     cooldown —— AUTH 类，**累加** fail_streak 并递增冷却
+ *                     soft     —— QUOTA/TRANSIENT 类，**不累加** streak，只短暂让位
+ *                                  （模型侧问题不该烧 Key，见 config.keySoftCooldownMs）
+ * @param nextRetryAt 冷却到期时间戳（action='cooldown'|'soft' 时有效）
  * @param streak     本次失败后的连续失败次数（由调用方算好，因为决策也在那边）
  */
 export function recordFailure(keyUuid, model, {
@@ -107,6 +110,16 @@ export function recordFailure(keyUuid, model, {
            fail_streak = COALESCE(?, fail_streak + 1),
            total_fail = total_fail + 1, last_error=?, last_used_at=?
          WHERE key_uuid=? AND model=?`, until, streak, error, now, keyUuid, model);
+    if (model !== '__probe__') bumpDaily(keyUuid, false, now);
+    return;
+  }
+
+  // ⭐ 软冷却：**只让位，不动 fail_streak** —— 模型侧问题不烧 Key。
+  if (action === 'soft') {
+    run(`UPDATE key_state SET state='COOLDOWN', next_retry_at=?, disabled_until=NULL,
+           fail_streak = fail_streak,
+           total_fail = total_fail + 1, last_error=?, last_used_at=?
+         WHERE key_uuid=? AND model=?`, nextRetryAt, error, now, keyUuid, model);
     if (model !== '__probe__') bumpDaily(keyUuid, false, now);
     return;
   }
@@ -242,12 +255,19 @@ export function listStates({ channel = null } = {}) {
  * 否则有 COOLDOWN 就显示 COOLDOWN（取最早到期的那条），全 READY 才算正常。
  * 这才是用户真正关心的："这把 Key 现在还能不能用"。
  *
+ * ⭐ 同时给出「**最后调用的是哪个模型**」（2026-10-07 用户要求）：
+ *   冷却中只看到"剩余 17 分 51 秒"是不够的 —— 你还想知道它是**被哪个模型打挂的**。
+ *   key_state 天然是 key×model 粒度且带 last_used_at，所以直接按时间取最近的一条即可，
+ *   无需新增列、无需额外写入。
+ *
  * @returns {Map<string,{state:string, untilAt:number|null, failStreak:number,
- *                       lastError:string|null, models:number, cooldownModels:number}>}
+ *                       lastError:string|null, models:number, cooldownModels:number,
+ *                       lastModel:string|null, lastModelAt:number|null,
+ *                       lastModelState:string|null}>}
  */
 export function keyHealthMap(now = Date.now()) {
   const rows = all(`
-    SELECT key_uuid, state, next_retry_at, disabled_until, fail_streak, last_error, model
+    SELECT key_uuid, state, next_retry_at, disabled_until, fail_streak, last_error, model, last_used_at
     FROM key_state
   `);
 
@@ -265,6 +285,7 @@ export function keyHealthMap(now = Date.now()) {
     const cur = out.get(r.key_uuid) ?? {
       state: 'READY', untilAt: null, failStreak: 0,
       lastError: null, models: 0, cooldownModels: 0,
+      lastModel: null, lastModelAt: null, lastModelState: null,
     };
     cur.models += 1;
     if (st === 'COOLDOWN') cur.cooldownModels += 1;
@@ -274,13 +295,21 @@ export function keyHealthMap(now = Date.now()) {
       cur.state = st;
       cur.untilAt = untilAt;
     } else if (st === cur.state && untilAt != null) {
-      // 同状态取**最早**到期（最快能用的那个时间点最乐观，但要给用户保守估计：
-      // 用最晚到期更贴近"这把 Key 什么时候真的可用"。这里取最晚。）
+      // 同状态取**最晚**到期（更贴近"这把 Key 什么时候真的可用"）
       cur.untilAt = cur.untilAt == null ? untilAt : Math.max(cur.untilAt, untilAt);
     }
     if (st !== 'READY') {
       cur.failStreak = Math.max(cur.failStreak, r.fail_streak ?? 0);
       cur.lastError = r.last_error ?? cur.lastError;
+    }
+    // 「最后一次调用」= last_used_at 最大的那条。
+    // 探针（__probe__）不算"业务调用"，但它确实是一次真实上游请求，
+    // 仍保留作为兜底 —— 纯粹的验活记录不会误导，反而能解释"为什么这把 Key 有记录"。
+    const at = Number(r.last_used_at ?? 0);
+    if (r.model && at > (cur.lastModelAt ?? 0)) {
+      cur.lastModel = r.model;
+      cur.lastModelAt = at;
+      cur.lastModelState = st;
     }
     out.set(r.key_uuid, cur);
   }

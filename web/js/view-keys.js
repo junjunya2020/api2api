@@ -147,6 +147,7 @@ function renderKeyTable() {
       el('td', { text: String(k.priority) }),
       el('td', { text: String(k.weight) }),
       el('td', {}, [runtimeStateCell(k)]),
+      el('td', {}, [recentRateCell(k)]),
       el('td', {}, [
         el('span', { class: k.enabled ? 'pill pill-ok' : 'pill pill-idle', text: k.enabled ? '启用' : '停用' }),
       ]),
@@ -184,11 +185,56 @@ function renderKeyTable() {
 }
 
 /**
+ * ⭐ 「近期成功率」单元格（2026-10-07 用户要求「统计一下成功率」）。
+ *
+ * 口径：后端 dailySummaryByKey 给出的**窗口内**（默认 3 天）成功/失败计数，
+ *   rate = ok / (ok + fail)。**没被调用过不算 0%** —— 那是"无数据"，不是"差"，
+ *   否则新绑的 Key 一上来就显示 0% 会被误判成坏 Key。
+ *
+ * 颜色阈值：≥95% 绿 / ≥70% 黄 / 其余红。
+ */
+function recentRateCell(k) {
+  const ok = k.recentOk || 0;
+  const fail = k.recentFail || 0;
+  const total = ok + fail;
+
+  if (!total) {
+    return el('div', { class: 'state-cell' }, [
+      el('span', { class: 'pill pill-idle', text: '无数据' }),
+      el('span', { class: 'muted', text: '窗口内未被调用' }),
+    ]);
+  }
+
+  const rate = ok / total;
+  const pct = (rate * 100).toFixed(rate >= 0.995 || rate === 0 ? 0 : 1);
+  const cls = rate >= 0.95 ? 'pill-ok' : rate >= 0.7 ? 'pill-warn' : 'pill-err';
+
+  return el('div', { class: 'state-cell' }, [
+    el('div', { class: 'state-line' }, [
+      el('span', { class: `pill ${cls}`, text: `${pct}%` }),
+      el('span', {
+        class: 'muted',
+        text: `${ok} 成功 / ${fail} 失败`,
+        title: `统计窗口内（默认最近 ${state.scheduler?.noSuccessDays ?? 3} 天）`,
+      }),
+    ]),
+    k.noSuccess
+      ? el('div', { class: 'last-model' }, [
+        el('span', { class: 'pill pill-err', text: '调用过但零成功' }),
+      ])
+      : null,
+  ]);
+}
+
+/**
  * 「运行状态」单元格。
  *
  * 语义（用户要求）：显示 **正常 / 冷却中 剩余多久 / 已禁用**。
  * 另外把每 Key RPM 限速也一并展示 —— 它同样是"此刻能不能用"的一部分。
  * 优先级：人工停用 > 自动禁用 > 冷却中 > 限速中 > 正常。
+ *
+ * ⭐ 2026-10-07 用户要求：「冷却中 要显示最后调用什么模型」——
+ *    因为冷却本身不说明问题，**是哪个模型把它打挂的**才是排查线索。
  */
 function runtimeStateCell(k) {
   const box = el('div', { class: 'state-cell' });
@@ -205,30 +251,52 @@ function runtimeStateCell(k) {
     text: remaining > 0 ? fmtCountdown(remaining) : '',
   });
 
+  // 「最后调用的模型」小行 —— 冷却/禁用时一定显示（这是排查的钥匙）
+  const lastModelNode = () => {
+    if (!k.lastModel) return null;
+    return el('div', { class: 'last-model' }, [
+      el('span', { class: 'muted', text: '最后调用 ' }),
+      el('span', {
+        class: k.lastModelBad ? 'pill pill-warn mono' : 'pill pill-idle mono',
+        text: k.lastModel,
+        title: k.lastModelAt ? `最后调用于 ${fmtAgo(k.lastModelAt)}` : k.lastModel,
+      }),
+      k.lastModelAt
+        ? el('span', { class: 'muted', text: ` · ${fmtAgo(k.lastModelAt)}` })
+        : null,
+    ]);
+  };
+
   if (k.state === 'DISABLED') {
     box.replaceChildren(
-      el('span', { class: 'pill pill-err', text: '已禁用' }),
-      remaining > 0
-        ? el('span', { class: 'muted', text: '剩余' })
-        : el('span', { class: 'muted', text: '已到期' }),
-      cd,
-      el('span', {
-        class: 'muted',
-        text: `· 连续失败 ${k.failStreak} 次，到期自动恢复`,
-      }),
+      el('div', { class: 'state-line' }, [
+        el('span', { class: 'pill pill-err', text: '已禁用' }),
+        remaining > 0
+          ? el('span', { class: 'muted', text: '剩余' })
+          : el('span', { class: 'muted', text: '已到期' }),
+        cd,
+        el('span', {
+          class: 'muted',
+          text: `· 连续失败 ${k.failStreak} 次，到期自动恢复`,
+        }),
+      ]),
+      lastModelNode(),
     );
     return box;
   }
 
   if (k.state === 'COOLDOWN') {
     box.replaceChildren(
-      el('span', { class: 'pill pill-warn', text: '冷却中' }),
-      el('span', { class: 'muted', text: '剩余' }),
-      cd,
-      el('span', {
-        class: 'muted',
-        text: k.failStreak > 1 ? `· 连续失败 ${k.failStreak} 次` : '· 成功一次即恢复',
-      }),
+      el('div', { class: 'state-line' }, [
+        el('span', { class: 'pill pill-warn', text: '冷却中' }),
+        el('span', { class: 'muted', text: '剩余' }),
+        cd,
+        el('span', {
+          class: 'muted',
+          text: k.failStreak > 1 ? `· 连续失败 ${k.failStreak} 次` : '· 成功一次即恢复',
+        }),
+      ]),
+      lastModelNode(),
     );
     return box;
   }
@@ -236,22 +304,28 @@ function runtimeStateCell(k) {
   if (k.rpmLimited) {
     const rpmCd = el('span', { class: 'muted mono', text: fmtCountdown(k.rpmRemainingMs || 0) });
     box.replaceChildren(
-      el('span', { class: 'pill pill-info', text: '限速中' }),
-      el('span', { class: 'muted', text: `本轮已用 ${k.rpmUsed}/${k.rpmLimit}，` }),
-      rpmCd,
-      el('span', { class: 'muted', text: '后轮换' }),
+      el('div', { class: 'state-line' }, [
+        el('span', { class: 'pill pill-info', text: '限速中' }),
+        el('span', { class: 'muted', text: `本轮已用 ${k.rpmUsed}/${k.rpmLimit}，` }),
+        rpmCd,
+        el('span', { class: 'muted', text: '后轮换' }),
+      ]),
+      lastModelNode(),
     );
     return box;
   }
 
   box.replaceChildren(
-    el('span', { class: 'pill pill-ok', text: '正常' }),
-    k.rpmLimit > 0
-      ? el('span', { class: 'muted mono', text: `本轮 ${k.rpmUsed}/${k.rpmLimit}` })
-      : el('span', {}),
-    k.failStreak > 0
-      ? el('span', { class: 'muted', text: `· 失败 ${k.failStreak} 次未清零` })
-      : el('span', {}),
+    el('div', { class: 'state-line' }, [
+      el('span', { class: 'pill pill-ok', text: '正常' }),
+      k.rpmLimit > 0
+        ? el('span', { class: 'muted mono', text: `本轮 ${k.rpmUsed}/${k.rpmLimit}` })
+        : el('span', {}),
+      k.failStreak > 0
+        ? el('span', { class: 'muted', text: `· 失败 ${k.failStreak} 次未清零` })
+        : el('span', {}),
+    ]),
+    lastModelNode(),
   );
   return box;
 }

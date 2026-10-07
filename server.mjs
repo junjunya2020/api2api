@@ -20,6 +20,7 @@ import { handleV1 } from './src/http/v1.mjs';
 import { handleKeys } from './src/http/admin-keys.mjs';
 import { handleAliases } from './src/http/admin-aliases.mjs';
 import { handleMeta } from './src/http/admin-meta.mjs';
+import { handleModelHealth } from './src/http/admin-model-health.mjs';
 import { serveStatic } from './src/http/static.mjs';
 import { extractToken, handleThrown, sendJson, sendError } from './src/http/util.mjs';
 
@@ -61,7 +62,7 @@ const server = http.createServer(async (req, res) => {
       if (!verifyToken(token)) {
         return sendError(res, 401, '管理 API 需要有效的 api2api token', { code: 'invalid_api_key' });
       }
-      for (const handler of [handleKeys, handleAliases, handleMeta]) {
+      for (const handler of [handleKeys, handleAliases, handleModelHealth, handleMeta]) {
         const r = await handler(req, res, url);
         if (r !== false) return;
       }

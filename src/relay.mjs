@@ -14,8 +14,11 @@
 import { Readable } from 'node:stream';
 import { getAdapter } from './adapters/index.mjs';
 import { resolveCandidates } from './db/aliases.mjs';
-import { getKeySecret } from './db/keys.mjs';
-import { pickKey, applyFailure, applySuccess } from './scheduler/index.mjs';
+import { getKeySecret, availableKeyCount, enabledKeyCount } from './db/keys.mjs';
+import {
+  pickKey, applyFailure, applySuccess,
+  channelBudget, modelGate, applyModelSuccess, applyModelFailure, ModelState,
+} from './scheduler/index.mjs';
 import * as rate from './scheduler/rate.mjs';
 import { ErrClass, ApiError, classifyByStatus } from './util/errors.mjs';
 import { logRequest } from './db/logs.mjs';
@@ -83,13 +86,54 @@ export async function relay({ publicModel, rawBody, pathTail = 'chat/completions
   const filtered = sorted.filter((c) => !isDefinitelyAbsent(c));
   // 兜底：全都"确定没有"时不能直接放弃 —— 目录可能过期（上游刚上新模型），
   // 宁可多打一次上游拿真实 404，也不要凭空报"没有渠道可用"。
-  const ordered = filtered.length ? filtered : sorted;
-  const skippedByCatalog = sorted.length - ordered.length;
+  const ordered0 = filtered.length ? filtered : sorted;
+  const skippedByCatalog = sorted.length - ordered0.length;
   if (skippedByCatalog > 0) {
     log.debug(`[relay] 按上游目录跳过 ${skippedByCatalog} 个确认没有该模型的渠道`);
   }
 
-  for (const cand of ordered) {
+  // ⭐ 模型级闸门（2026-10-07）—— **只改"试几次"，不改"先试谁"**。
+  //
+  //   ⚠️ 关键设计约束：**渠道优先级（sort_order）是主序，绝不能被模型健康度打乱**。
+  //      这是用户反复强调的铁律（「商汤 > 书生 > OpenRouter」）。
+  //      所以这里**保持 ordered0 的渠道顺序**，模型健康度只决定该渠道允许试几次：
+  //
+  //   NORMAL      → 用渠道熔断预算（可用 Key 数的 1/4，上限 maxAttemptsPerChannel）
+  //   DEGRADED    → 只试 **1 次**（快速证伪；不占熔断预算，烧不到池子）
+  //   UNAVAILABLE → **跳过**该渠道；仅当**所有**候选都被熔断时才兜底试 1 次
+  //
+  //   效果：坏模型在商汤只花 1 次尝试就落到书生，书生的池子完全不受影响。
+  const gated = ordered0.map((c) => ({
+    cand: c,
+    gate: c.channelId
+      ? modelGate(c.channelId, c.upstreamName, { channelName: c.channelName })
+      : { allow: true, attempts: 0, state: ModelState.NORMAL, reason: null, fromRule: false },
+  }));
+
+  // 只剔掉"确定不可用"的，其余**原样保持渠道优先级顺序**
+  let ordered = gated.filter((g) => g.gate.allow);
+
+  if (!ordered.length) {
+    if (gated.length) {
+      // 全都被熔断 → 兜底：给**优先级最高**的那个一次机会（attempts=1），
+      // 否则一个刚被熔断的模型会让整个请求立刻失败。
+      log.warn(`[relay] 模型 ${publicModel} 在所有候选渠道均被熔断，兜底试一次`);
+      const first = gated[0];
+      ordered = [{ ...first, gate: { ...first.gate, allow: true, attempts: 1 } }];
+    } else {
+      logRequest({
+        model: null, publicModel, channelId: null, keyUuid: null,
+        status: 503, errClass: ErrClass.NO_KEY, upstreamTrace: null,
+        latencyMs: null, attempts: 0, chain: null,
+      });
+      throw new ApiError(503, `模型 "${publicModel}" 的候选渠道均不可用（全部被熔断或没有可用 Key）`, {
+        code: 'no_available_channel', type: 'insufficient_quota',
+        errClass: ErrClass.NO_KEY, retryAfterMs: config.downstreamRetryAfterMs, logged: true,
+      });
+    }
+  }
+
+  for (const { cand, gate } of ordered) {
     if (attempts >= config.maxAttempts) {
       log.warn(`[relay] 达到全局最大尝试次数 ${config.maxAttempts}，停止`);
       break;
@@ -99,28 +143,52 @@ export async function relay({ publicModel, rawBody, pathTail = 'chat/completions
     const adapter = getAdapter(cand.adapter);
     const url = `${cand.baseUrl.replace(/\/+$/, '')}/${pathTail}`;
 
-    // 同一渠道内可能有多把 Key：循环取 Key，直到该渠道无可选
-    const perChannelLimit = config.maxAttemptsPerChannel > 0 ? config.maxAttemptsPerChannel : Infinity;
+    // ⭐ 熔断预算：本次在该渠道最多试几把 Key。
+    //    分母用「该渠道 + 该模型下**当前可用**的 Key 数」——
+    //    池子被打掉一批时分母跟着变小，才不会把剩下那几把也烧掉。
+    //    用户要求：「最多尝试四分之一的号，不然一直切换 key 重试全死了」。
+    const available = availableKeyCount(cand.channelId, cand.upstreamName);
+    const budget = channelBudget(available || enabledKeyCount(cand.channelId) || 1);
+    // 模型降级 / 兜底场景只允许试 1 次（快速证伪，别占用预算）
+    const perChannelLimit = gate.attempts > 0
+      ? Math.min(gate.attempts, budget)
+      : budget;
+
+    if (gate.state !== ModelState.NORMAL) {
+      log.debug(`[relay] ${cand.channelName}/${cand.upstreamName} 模型健康度=${gate.state}（${gate.reason}），限试 ${perChannelLimit} 次`);
+    }
+
     let channelTries = 0;
     let skipChannel = false;
 
     for (;;) {
       if (attempts >= config.maxAttempts) break;
       if (channelTries >= perChannelLimit) {
-        log.debug(`[relay] 渠道 ${cand.channelName} 已达本渠道尝试上限 ${perChannelLimit}，降级下一渠道`);
-        chain.push({ channel: cand.channelName, key: null, note: `本渠道尝试上限 ${perChannelLimit}` });
+        log.debug(`[relay] 渠道 ${cand.channelName} 已达熔断预算 ${perChannelLimit}（可用 ${available} 把），降级下一渠道`);
+        chain.push({
+          channel: cand.channelName, channelDisplay: cand.channelDisplay,
+          key: null, upstreamModel: cand.upstreamName,
+          note: `本渠道熔断预算 ${perChannelLimit} 已用尽（可用 ${available} 把 Key）`,
+        });
         break;
       }
 
       const key = pickKey(cand.channelId, cand.upstreamName, tried);
       if (!key) {
-        chain.push({ channel: cand.channelName, key: null, note: '渠道内无可选 Key' });
+        chain.push({
+          channel: cand.channelName, channelDisplay: cand.channelDisplay,
+          key: null, upstreamModel: cand.upstreamName,
+          note: '渠道内无可选 Key',
+        });
         break; // 该渠道耗尽 → 落到下一个渠道
       }
 
       const secret = getKeySecret(key.uuid);
       if (!secret) {
-        chain.push({ channel: cand.channelName, key: key.uuid, note: '密钥解密失败' });
+        chain.push({
+          channel: cand.channelName, channelDisplay: cand.channelDisplay,
+          key: key.uuid, upstreamModel: cand.upstreamName, note: '密钥解密失败',
+        });
         tried.add(key.uuid);
         continue;
       }
@@ -160,6 +228,8 @@ export async function relay({ publicModel, rawBody, pathTail = 'chat/completions
         };
         chain.push(rec);
         applyFailure(key.uuid, cand.upstreamName, ErrClass.TRANSIENT, e.message);
+        // ⭐ 连接失败也计入模型健康度（连续抖动说明这个模型不稳）
+        applyModelFailure(cand.channelId, cand.upstreamName, ErrClass.TRANSIENT, e.message, cand.channelName);
         lastVerdict = { errClass: ErrClass.TRANSIENT, message: e.message, traceId: null };
         lastChannel = cand; lastKey = key.uuid;
         continue;
@@ -175,12 +245,16 @@ export async function relay({ publicModel, rawBody, pathTail = 'chat/completions
           status: res.status, errClass: ErrClass.OK, latencyMs,
         });
         applySuccess(key.uuid, cand.upstreamName);
+        // ⭐ 模型健康度立刻回 NORMAL —— 成功即恢复健康
+        applyModelSuccess(cand.channelId, cand.upstreamName, cand.channelName);
 
         return {
           response: res,
           meta: {
             channel: cand, keyUuid: key.uuid, status: res.status,
-            latencyMs, attempts, chain, errClass: ErrClass.OK,
+            latencyMs, attempts, chain,
+            errClass: ErrClass.OK,
+            modelState: gate.state,
           },
         };
       }
@@ -201,7 +275,12 @@ export async function relay({ publicModel, rawBody, pathTail = 'chat/completions
       lastChannel = cand;
       lastKey = key.uuid;
 
-      // 分类驱动动作
+      // ⭐ 模型健康度归因（与 Key 动作**分开**）：
+      //   只有"这个模型不行"类错误才计入 —— REQUEST_FAULT 是请求体问题，不算。
+      //   注意计量在**失败时也要更新 last_used_at**，Key 列表才能显示"最后调用的模型"。
+      const mh = applyModelFailure(cand.channelId, cand.upstreamName, verdict.errClass, verdict.message, cand.channelName);
+
+      // 分类驱动动作（Key 侧）
       const act = applyFailure(key.uuid, cand.upstreamName, verdict.errClass, verdict.message);
 
       // ① 请求本身的问题：换谁都白搭 → 立即把上游错误还给客户端
@@ -224,13 +303,16 @@ export async function relay({ publicModel, rawBody, pathTail = 'chat/completions
 
       // ② 「该渠道没有这个模型」—— 渠道内换 Key 结果一样，直接落下一渠道。
       //    这是跨渠道能力的核心：glm-5.3 只在书生有，商汤 404 时必须继续往下走。
+      //
+      //    ⚠️ CONFIG_FAULT **不计入**模型健康度（上游事实，不是"模型坏了"），
+      //       所以这里不能因为 mh 降级就提前放弃 —— 换渠道才是正解。
       if (act.action === 'skip_channel') {
         log.debug(`[relay] ${cand.channelName} 整体跳过（${verdict.errClass}：${verdict.message}），换下一渠道`);
         skipChannel = true;
         break;
       }
 
-      log.debug(`[relay] ${cand.channelName}/${key.uuid} 失败(${verdict.errClass})，换下一个候选`);
+      log.debug(`[relay] ${cand.channelName}/${key.uuid} 失败(${verdict.errClass})${mh ? ` 模型健康度→${mh.state}` : ''}，换下一个候选`);
       // ③ 继续内层循环：换 Key
     }
     if (skipChannel) continue;
@@ -331,6 +413,7 @@ function pickDominantError(chain) {
     ErrClass.QUOTA,        // 429：配额/限流，稍后必可重试
     ErrClass.TRANSIENT,    // 5xx：上游抽风，稍后可重试
     ErrClass.AUTH,         // 401：Key 全废
+    ErrClass.MODEL_UNAVAILABLE, // 被我们主动熔断的模型（可手动重置恢复）
     ErrClass.CONFIG_FAULT, // 404：模型确实哪都没有
     ErrClass.NO_KEY,       // 无 Key 可用
     ErrClass.REQUEST_FAULT,
@@ -350,6 +433,8 @@ function statusForExhausted(errClass) {
     case ErrClass.CONFIG_FAULT: return 404; // 映射配错
     case ErrClass.REQUEST_FAULT: return 400;
     case ErrClass.NO_KEY: return 503;
+    // 被熔断的模型：对下游语义就是"暂时不可用，稍后可能恢复"（24h 后自动观察）
+    case ErrClass.MODEL_UNAVAILABLE: return 503;
     default: return 503;                    // TRANSIENT：确实是可恢复的服务不可用
   }
 }
@@ -358,7 +443,8 @@ function statusForExhausted(errClass) {
  *  注意用 downstreamRetryAfterMs（20 秒级）而非 cooldownBaseMs（1 秒级）：
  *  1 秒会让客户端立刻重试、立刻再被限流，反而加重上游压力。 */
 function retryForExhausted(errClass) {
-  if (errClass === ErrClass.QUOTA || errClass === ErrClass.TRANSIENT || errClass === ErrClass.NO_KEY) {
+  if (errClass === ErrClass.QUOTA || errClass === ErrClass.TRANSIENT
+    || errClass === ErrClass.NO_KEY || errClass === ErrClass.MODEL_UNAVAILABLE) {
     return config.downstreamRetryAfterMs;
   }
   return null;
@@ -442,6 +528,7 @@ function typeForClass(errClass) {
     case ErrClass.CONFIG_FAULT: return 'invalid_request_error';
     case ErrClass.TRANSIENT: return 'api_error';
     case ErrClass.NO_KEY: return 'insufficient_quota';
+    case ErrClass.MODEL_UNAVAILABLE: return 'insufficient_quota';
     default: return 'api_error';
   }
 }

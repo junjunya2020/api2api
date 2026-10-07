@@ -83,6 +83,21 @@ export const api = {
   states: (channel) => request('GET', `/api/stats/states${channel ? `?channel=${encodeURIComponent(channel)}` : ''}`),
   logs: (limit) => request('GET', `/api/logs?limit=${limit || 100}`),
 
+  // ⭐ 模型健康度（正常 / 降级 / 不可用）
+  modelHealth: ({ channel, state } = {}) => {
+    const q = new URLSearchParams();
+    if (channel) q.set('channel', channel);
+    if (state) q.set('state', state);
+    const s = q.toString();
+    return request('GET', `/api/model-health${s ? `?${s}` : ''}`);
+  },
+  resetModelHealth: (channel, model) => request('POST', '/api/model-health/reset', { channel, model: model ?? null }),
+  modelRules: () => request('GET', '/api/model-rules'),
+
+  // ⭐ 成功率
+  rates: (limit) => request('GET', `/api/stats/rates?limit=${limit || 5000}`),
+  ratesByModel: (limit) => request('GET', `/api/stats/rates/model?limit=${limit || 5000}`),
+
   // token
   tokens: () => request('GET', '/api/tokens'),
   newToken: (name) => request('POST', '/api/tokens', { name }),

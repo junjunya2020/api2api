@@ -334,14 +334,33 @@ textarea.input { resize: vertical; min-height: 96px; font-family: var(--mono); f
 /* ===== Key 运行状态单元格 ===== */
 .state-cell {
   display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 5px;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 3px;
   white-space: nowrap;
   font-size: 12.5px;
 }
+/* 第一行：状态徽标 + 倒计时（水平排布） */
+.state-cell .state-line {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+/* 第二行：最后调用的模型 —— 冷却/禁用时排查"是谁打挂的" */
+.state-cell .last-model {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px;
+  font-size: 11.5px;
+}
 /* 倒计时数字等宽，避免每秒跳动时列宽抖动 */
 .state-cell .mono { font-variant-numeric: tabular-nums; }
+
+/* chip 里的计数着色（模型健康度汇总条） */
+.chip .chip-warn { color: var(--warn); }
+.chip .chip-err { color: var(--err); }
 
 /* 策略提示行：贴在表格下方，说明当前策略与冷却规则 */
 .policy-hint {

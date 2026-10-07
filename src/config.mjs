@@ -99,6 +99,96 @@ export const config = {
    */
   maxAttemptsPerChannel: int('MAX_ATTEMPTS_PER_CHANNEL', 8),
 
+  /**
+   * 单个渠道内，一次请求最多尝试该渠道**可用 Key 总数的几分之一**。
+   *
+   * ⭐ 用户要求（2026-10-07 原话）：
+   *   「那些商汤 尝试要熔断 最多尝试四分之一的号 不然一直切换 key 重试全死了」
+   *
+   * 为什么需要：某个模型持续失败时，若把渠道内所有 Key 都试一遍，
+   *   几十把 Key 会**同时**被打进冷却 —— 池子被一个坏模型烧穿。
+   *   限制成 1/4 后，坏模型最多烧掉四分之一的 Key，剩余 3/4 仍可服务其它模型。
+   *
+   * 与 `maxAttemptsPerChannel` 的关系：**两者取小**。
+   *   maxAttemptsPerChannel 是用户配置的硬上限（默认 8），
+   *   本项是按池子规模动态算出的熔断线（ceil(可用Key数 / 4)）。
+   *   例：渠道 8 把 Key → min(8, 2) = 2；渠道 40 把 Key → min(8, 10) = 8。
+   *
+   * 设 0 表示不启用本熔断（退回只看 maxAttemptsPerChannel）。
+   */
+  channelCircuitFraction: int('CHANNEL_CIRCUIT_FRACTION', 4),
+
+  /**
+   * 本渠道熔断预算的**下限**（至少允许试几把）。
+   *
+   * ⚠️ 默认 **2**，不是 1 —— 这是可用性底线，不是可调项：
+   *   `ceil(3把 / 4) = 1`，若下限是 1，则小池子一次就放弃，
+   *   **连"换一把 Key"都做不到**，一个偶发 429 就让整条渠道被跳过。
+   *   （真实回归：e2e 三条路由用例因此全落到下一渠道。）
+   *
+   *   2 的含义 = "至少能换一把 Key 再下结论"，同时仍远低于打穿池子。
+   *   单 Key 渠道会被 clamp 到 1（池子只有 1 把，不可能试 2 次），仍可用。
+   */
+  channelCircuitMin: int('CHANNEL_CIRCUIT_MIN', 2),
+
+  /**
+   * 「模型级」降级阈值 —— 同一 (渠道, 模型) 累计连续失败多少次 → DEGRADED。
+   *
+   * ⭐ 用户要求（2026-10-07）：「分多级才行，不然全池子死了：正常 → 降级 → 不可用」
+   *
+   * 计数**跨 Key 累计**（换 Key 打同一模型失败也计入）——
+   * 这样"多把 Key 都打不通"才算模型坏，而不是一把 Key 倒霉就封模型。
+   */
+  modelDegradeAfterFails: int('MODEL_DEGRADE_AFTER_FAILS', 3),
+
+  /** 模型累计连续失败多少次 → UNAVAILABLE（直接跳过） */
+  modelUnavailableAfterFails: int('MODEL_UNAVAILABLE_AFTER_FAILS', 6),
+
+  /**
+   * ⭐ 「内置问题模型规则」开关（2026-10-07）。
+   *
+   * 有些模型**上游就是喜欢 429**（用户原话），或**画图模型失效了不判真失效**，
+   * 需要在**首次遇到时就按已知规律预置健康度** —— 而不是等它把 Key 池子烧穿
+   * 才慢慢学习到"这个模型不行"。
+   *
+   * 比如 `sensenova-u1-fast` 这类文生图模型走的是 `/v1/images/generations`，
+   * 用 chat 端点探活必然 404 —— 但 404 是"路径不对"，**不代表模型坏了**。
+   * 内置规则把它标为"已知特殊"，避免误熔断。
+   *
+   * 设 0 关闭内置规则（完全靠运行时学习）。
+   */
+  builtinModelRules: int('BUILTIN_MODEL_RULES', 1),
+
+  /**
+   * ⭐ 已知「上游偏好 429」的模型名单（逗号分隔的上游模型名）。
+   *
+   * 这些模型首次出现时直接预置为 **DEGRADED**（降级观察）：
+   *   - 参与调度，但排到候选末尾
+   *   - 每次请求只试 **1 次**（快速证伪，不占熔断预算）
+   *
+   * 这样既不会因为一个爱 429 的模型烧掉大量 Key，
+   * 又保留了"万一它现在好了"的可用性（试 1 次成功即回 NORMAL）。
+   *
+   * 空字符串 = 名单由 `src/db/model-rules.mjs` 的内置表提供。
+   */
+  rateLimitProneModels: pick('RATE_LIMIT_PRONE_MODELS', ''),
+
+  /**
+   * ⭐ 已知「走非 chat 端点」的模型名单（逗号分隔上游模型名）。
+   *
+   * 典型是文生图模型（商汤 `sensenova-u1-*`）—— 它们走 `/v1/images/generations`，
+   * 用 chat 探活会 404。**这类 404 不该计入模型健康度**，
+   * 否则一个根本没用错的模型会被熔断。
+   */
+  nonChatModels: pick('NON_CHAT_MODELS', ''),
+
+  /**
+   * 模型被标 UNAVAILABLE 后的自动恢复时间（毫秒，默认 24 小时）。
+   * 到期后**降到 DEGRADED 观察**（不是直接回 NORMAL）——
+   * 直接回 NORMAL 会让一个真坏的模型每 24h 又被全池子试一轮，循环烧 Key。
+   */
+  modelDisabledRecoverMs: int('MODEL_DISABLED_RECOVER_MS', 24 * 3600_000),
+
   /** 请求体大小上限 */
   maxBodyBytes: int('MAX_BODY_BYTES', 8 * 1024 * 1024),
 
@@ -145,6 +235,20 @@ export const config = {
    * 用户要求（2026-10-07）：「默认不要轮询，默认是填满优先」。
    */
   schedulerPolicy: pick('SCHEDULER_POLICY', 'fill_first'),
+
+  /**
+   * Key 的**软冷却**时长（毫秒，默认 60 秒）。
+   *
+   * ⭐ 2026-10-07 新增。用于 QUOTA(429) / TRANSIENT 这类**模型侧问题**：
+   *   Key 本身没坏，只是这次被上游限流了 → 让位一小会儿，不累加连续失败、
+   *   也不递增冷却。真正的判定交给「模型健康度」（累计到阈值直接 ban 模型）。
+   *
+   * 为什么不能沿用递增冷却：一个坏模型连打 10 次就能把一把好 Key 禁用 ——
+   *   用户明确要求「ban 的话只 ban 模型，不 ban key」。
+   *
+   * 设 0 表示不软冷却（QUOTA/TRANSIENT 完全不动 Key 状态）。
+   */
+  keySoftCooldownMs: int('KEY_SOFT_COOLDOWN_MS', 60_000),
 
   /**
    * 每把 Key 每分钟最多发起多少次上游请求（RPM）。

@@ -13,6 +13,20 @@ export const ErrClass = {
   REQUEST_FAULT: 'request_fault',
   CONFIG_FAULT: 'config_fault',
   NO_KEY: 'no_key',
+  /**
+   * ⭐ 「该渠道的这个模型已被模型级熔断器标记为不可用」（2026-10-07 新增）。
+   *
+   * 与 CONFIG_FAULT 的区别（别混）：
+   *   CONFIG_FAULT     —— 上游明确回"我这没这个模型"（404 / model_not_found），
+   *                       是**上游事实**，换渠道可能就有。
+   *   MODEL_UNAVAILABLE —— 我们**自己**根据连续失败（多次不同 Key 都打不通）
+   *                       判定该模型在该渠道是坏的，主动跳过一次都不试。
+   *                       24 小时后自动降到 DEGRADED 观察。
+   *
+   * 为什么单独一个分类：用户要看得出「这是被我熔断的」还是「上游真没有」——
+   * 前者可以手动重置，后者只能换渠道。
+   */
+  MODEL_UNAVAILABLE: 'model_unavailable',
 };
 
 /** 这些分类意味着"该换 Key / 换渠道" */

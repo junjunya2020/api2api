@@ -70,6 +70,26 @@ const TEXT_HINTS = [
   { re: /context.*(length|token)|max.*token.*exceed|too long|上下文/i, errClass: ErrClass.REQUEST_FAULT },
 ];
 
+/**
+ * ⭐ 「模型级」覆盖 —— 把伪装成 AUTH/PERMISSION_DENIED 的**模型问题**纠正过来。
+ *
+ * 真 Key 实测（2026-10-07，逐个模型扫描）：
+ *   `deepseek-v4.1-flash` → HTTP 403, code=7(PERMISSION_DENIED)
+ *      message: "model is not available in the current token plan"
+ *
+ * 这条如果按 gRPC 表走会被归成 **AUTH**，后果很严重：
+ *   · Key 侧：AUTH 会走**递增冷却直到禁用** → 一个"套餐里没有某模型"的错误
+ *     会把整把 Key 禁用掉（用户明确反对：「ban 的话只 ban 模型，不 ban key」）
+ *   · 模型侧：AUTH 被排除在模型健康度之外 → 这个模型永远学不到"它不可用"
+ *
+ * 语义上它等价于「该渠道（该套餐）没有这个模型」→ 归类 **CONFIG_FAULT**：
+ *   换 Key 无用、跳过本渠道剩余 Key、不惩罚 Key，且**计入模型健康度**。
+ *
+ * ⚠️ 判定必须同时看消息内容 —— PERMISSION_DENIED 本身也可能真是 Key 无权限，
+ *    那种情况消息里会是 key/token/unauthorized 之类，不能被这条覆盖。
+ */
+const MODEL_LEVEL_AUTH_TEXT = /token ?plan|model .{0,30}(not|un)?available|not available in (the )?current|subscription|套餐|未订阅|没有权限使用该模型/i;
+
 export class SensenovaAdapter extends BaseAdapter {
   constructor() {
     super({
@@ -114,10 +134,20 @@ export class SensenovaAdapter extends BaseAdapter {
       : (typeof rawCode === 'string' && /^\d+$/.test(rawCode) ? +rawCode : null);
     if (numCode != null && GRPC_MAP[numCode]) {
       const m = GRPC_MAP[numCode];
+      // ⭐ 模型级覆盖：AUTH 类的数字 code + "模型不可用/不在套餐" 消息 →
+      //    这不是 Key 的问题，改判 CONFIG_FAULT（详见 MODEL_LEVEL_AUTH_TEXT 注释）
+      if (m.errClass === ErrClass.AUTH && MODEL_LEVEL_AUTH_TEXT.test(String(message))) {
+        return { errClass: ErrClass.CONFIG_FAULT, message: message || `gRPC ${numCode}`, code: rawCode, traceId };
+      }
       return { errClass: m.errClass, message: message || `gRPC ${numCode}`, code: rawCode, traceId };
     }
 
     // ③ 文本特征兜底（code 未知或缺失时）
+    //    ⚠️ "模型不在套餐" 必须在通用 AUTH 规则**之前**判断，
+    //       否则 `permission` 那条会先命中，把模型问题误判成 Key 问题。
+    if (MODEL_LEVEL_AUTH_TEXT.test(String(message))) {
+      return { errClass: ErrClass.CONFIG_FAULT, message: message || String(rawCode), code: rawCode, traceId };
+    }
     for (const h of TEXT_HINTS) {
       if (h.re.test(String(message))) {
         return { errClass: h.errClass, message: message || String(rawCode), code: rawCode, traceId };

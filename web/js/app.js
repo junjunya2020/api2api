@@ -29,6 +29,17 @@ const views = {
   },
   stats: async () => {
     if (!keysView.getChannels().length) await keysView.loadChannels();
+    // 模型健康度面板的渠道筛选 —— 复用已加载的渠道列表
+    const sel = document.querySelector('#mhFilterChannel');
+    if (sel && !sel.options.length) {
+      const chans = keysView.getChannels();
+      for (const c of chans) {
+        const o = document.createElement('option');
+        o.value = c.name;
+        o.textContent = `${c.displayName}（${c.name}）`;
+        sel.appendChild(o);
+      }
+    }
     await statsView.loadStats();
   },
   settings: async () => {

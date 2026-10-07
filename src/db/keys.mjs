@@ -222,6 +222,38 @@ export function candidatesForChannel(channelId, model, now = Date.now()) {
     }));
 }
 
+/**
+ * ⭐ 该渠道当前**可用**的 Key 数（非冷却、非禁用、已启用）。
+ *
+ * 供熔断预算分母使用（`channelBudget`）。语义要点：
+ *   用「**可用** Key 数」而不是「全部 Key 数」—— 池子已被打掉一批时，
+ *   分母跟着变小才不会把剩下那几把也烧掉。熔断的本质是"别把池子打穿"，
+ *   所以参照系必须是"现在还站着的"。
+ *
+ * @param {string} channelId
+ * @param {string} model 该模型维度下的 key_state 状态（粒度是 key×model）
+ * @param {number} now
+ */
+export function availableKeyCount(channelId, model, now = Date.now()) {
+  const row = one(`
+    SELECT COUNT(*) AS n
+    FROM channel_key k
+    LEFT JOIN key_state s ON s.key_uuid = k.uuid AND s.model = ?
+    WHERE k.channel_id = ? AND k.enabled = 1
+      AND COALESCE(s.state, 'READY') <> 'DISABLED'
+      AND NOT (COALESCE(s.state, 'READY') = 'COOLDOWN' AND COALESCE(s.next_retry_at, 0) > ?)
+  `, model, channelId, now);
+  return Number(row?.n ?? 0);
+}
+
+/**
+ * 该渠道**启用**的 Key 总数（不看状态）—— 熔断预算的兜底分母。
+ */
+export function enabledKeyCount(channelId) {
+  const row = one('SELECT COUNT(*) AS n FROM channel_key WHERE channel_id = ? AND enabled = 1', channelId);
+  return Number(row?.n ?? 0);
+}
+
 /** 统计：Key 总数 / 各状态数 */
 export function keyStats() {
   return all(`
@@ -240,4 +272,5 @@ export default {
   addKey, addKeysBulk, getKey, getKeySecret, listKeys, patchKey,
   deleteKey, deleteKeysByChannel, markChecked, candidatesForChannel, keyStats,
   ownerKeyUuids, listOwners, renewGrace, graceUntilOf,
+  availableKeyCount, enabledKeyCount,
 };

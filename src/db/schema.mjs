@@ -72,6 +72,39 @@ CREATE TABLE IF NOT EXISTS key_state (
 --    "no such column"，导致整个 DDL 执行失败、进程起不来。
 --    必须在 ALTER TABLE 补列之后，单独、逐条建索引。
 
+-- 「模型级」健康度 —— 粒度 = (渠道 × 上游模型)，**与 Key 无关**。
+--
+-- ⭐ 为什么需要这张表（用户 2026-10-07 明确要求）：
+--   key_state 的粒度是 (Key × 模型)，只能表达"这把 Key 在这个模型上不行"。
+--   但真实故障常常是「**这个模型**在某渠道就是不行」——典型是上游对该模型
+--   持续 429，或该模型根本不在 token plan 里。此时**惩罚 Key 是错的**：
+--   换一把 Key 打同一个模型照样失败，结果是把整个 Key 池子全部烧成冷却。
+--
+--   用户原话：「有些模型上游就是喜欢429」「ban的话只ban模型，不ban key」
+--             「分多级才行，不然全池子死了：正常 → 降级 → 不可用」
+--
+-- 三级状态机：
+--   NORMAL     正常    —— 按 1/4 熔断预算尝试
+--   DEGRADED   降级    —— 已连续失败若干次；**排到候选末尾**且只允许 1 次尝试
+--   UNAVAILABLE 不可用 —— 直接跳过（除非全渠道都不可用才兜底）；24 小时后自动恢复
+CREATE TABLE IF NOT EXISTS model_health (
+  channel_id     TEXT NOT NULL REFERENCES channel(id) ON DELETE CASCADE,
+  model          TEXT NOT NULL,
+  state          TEXT NOT NULL DEFAULT 'NORMAL',
+  fail_streak    INTEGER NOT NULL DEFAULT 0,
+  total_ok       INTEGER NOT NULL DEFAULT 0,
+  total_fail     INTEGER NOT NULL DEFAULT 0,
+  -- DEGRADED 的冷却到期（到期后仍留在 DEGRADED，靠一次成功才能回 NORMAL）
+  cooldown_until INTEGER,
+  -- UNAVAILABLE 的自动恢复时间
+  disabled_until INTEGER,
+  last_ok_at     INTEGER,
+  last_error     TEXT,
+  reason         TEXT,
+  updated_at     INTEGER NOT NULL,
+  PRIMARY KEY (channel_id, model)
+);
+
 -- 上游模型目录：从各渠道 GET /models 拉回来的真实模型清单（落库，供下游 /v1/models 输出）
 CREATE TABLE IF NOT EXISTS upstream_model (
   channel_id TEXT NOT NULL REFERENCES channel(id) ON DELETE CASCADE,

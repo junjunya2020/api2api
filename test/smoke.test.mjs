@@ -33,6 +33,11 @@ const { selectSmoothWRR } = await import('../src/scheduler/index.mjs');
 const sensenova = (await import('../src/adapters/sensenova.mjs')).default;
 const intern = (await import('../src/adapters/intern.mjs')).default;
 const { ErrClass, RETRYABLE, FATAL_FOR_REQUEST, FATAL_FOR_CHANNEL } = await import('../src/util/errors.mjs');
+const mh = await import('../src/db/model-health.mjs');
+const modelRules = await import('../src/db/model-rules.mjs');
+const dbx = await import('../src/db/index.mjs');
+const logsDb = await import('../src/db/logs.mjs');
+const { shape: shapeFn } = await import('../src/http/admin-keys.mjs');
 
 let pass = 0;
 let fail = 0;
@@ -274,28 +279,46 @@ t('错误分类决策：request_fault 不换 Key', () => {
   assert.strictEqual(act.retry, false);
   assert.strictEqual(act.action, 'none');
 });
-t('错误分类决策：quota 换 Key 并冷却', () => {
+t('错误分类决策：quota 换 Key，但只做「软冷却」（不打 Key）', () => {
+  // ⭐ 2026-10-07 语义变更：QUOTA(429) 常是**模型级**限流，换 Key 打同一模型照样 429。
+  //    用户要求「ban 的话只 ban 模型，不 ban key」—— 所以 Key 只短暂让位，
+  //    **不累加 fail_streak**（否则一个坏模型连打 10 次就能把好 Key 禁用）。
   const act = sched.decideAction('x', 'm', ErrClass.QUOTA, 0);
-  assert.strictEqual(act.retry, true);
-  assert.strictEqual(act.action, 'cooldown');
-  assert.ok(act.nextRetryAt > Date.now());
+  assert.strictEqual(act.retry, true, '仍要换下一个候选');
+  assert.strictEqual(act.action, 'soft', 'Key 侧动作应是 soft（短暂让位）');
+  assert.strictEqual(act.streak, 0, '软冷却不累加连续失败次数');
+  assert.ok(act.nextRetryAt > Date.now(), '要给一个冷却到期时间');
+  assert.strictEqual(act.cooldownMs, config.keySoftCooldownMs, '冷却时长 = keySoftCooldownMs');
 });
+
+t('★ QUOTA 连打 10 次也不会禁用 Key（模型侧问题不烧 Key）', () => {
+  let prev = 0;
+  for (let i = 0; i < 12; i++) {
+    const act = sched.decideAction('x', 'm', ErrClass.QUOTA, prev);
+    assert.strictEqual(act.action, 'soft', `第 ${i + 1} 次 QUOTA 仍应是 soft，不能 disable`);
+    assert.strictEqual(act.streak, prev, 'streak 始终不增长');
+    prev = act.streak;
+  }
+  assert.strictEqual(prev, 0);
+});
+
 t('错误分类决策：auth 连败达阈值则停用', () => {
-  // 用户要求：第 10 次连续失败才禁用
+  // 用户要求：第 10 次连续失败才禁用。
+  // ⭐ AUTH 是**唯一**该 ban Key 的场景（Key 真死了，换模型也一样）。
   const before = sched.decideAction('x', 'm', ErrClass.AUTH, 8);
   assert.strictEqual(before.action, 'cooldown', '第 9 次失败仍应冷却');
   const act = sched.decideAction('x', 'm', ErrClass.AUTH, 9);
   assert.strictEqual(act.action, 'disable', '第 10 次连续失败应禁用');
   assert.strictEqual(act.streak, 10);
 });
-t('线性冷却：10min × 连续失败次数，第 10 次禁用', () => {
+t('线性冷却：10min × 连续失败次数，第 10 次禁用（AUTH 场景）', () => {
   const min = 60_000;
   assert.strictEqual(sched.cooldownFor(1), 10 * min);
   assert.strictEqual(sched.cooldownFor(2), 20 * min);
   assert.strictEqual(sched.cooldownFor(3), 30 * min);
   assert.strictEqual(sched.cooldownFor(9), 90 * min);
-  // 第 10 次不再冷却，直接禁用
-  const act = sched.decideAction('x', 'm', ErrClass.QUOTA, 9);
+  // 第 10 次不再冷却，直接禁用（用 AUTH —— 只有它会走递增冷却）
+  const act = sched.decideAction('x', 'm', ErrClass.AUTH, 9);
   assert.strictEqual(act.action, 'disable');
   assert.strictEqual(act.cooldownMs, 0);
 });
@@ -668,6 +691,31 @@ t('商汤 400 code "3" + MaxTokens → REQUEST_FAULT（不能被 token.*invalid 
   });
   const v = sensenova.classify(400, {}, body);
   assert.strictEqual(v.errClass, ErrClass.REQUEST_FAULT, `实际 ${v.errClass}`);
+});
+
+t('★★ 商汤 403 code 7 +「不在 token plan」→ CONFIG_FAULT（不是 AUTH！）', () => {
+  // 真 Key 实测（2026-10-07）：`deepseek-v4.1-flash` 返回
+  //   HTTP 403, {"error":{"code":7,"message":"model is not available in the current token plan"}}
+  //
+  // ⚠️ 这是**必须锁住**的坑：gRPC 7 = PERMISSION_DENIED → 按表会被归成 AUTH，
+  //    而 AUTH 的动作是**递增冷却直到禁用整把 Key** ——
+  //    一个"套餐里没这个模型"的错误会把一把好 Key 废掉，
+  //    直接违反用户要求「ban 的话只 ban 模型，不 ban key」。
+  const body = JSON.stringify({
+    error: { message: 'model is not available in the current token plan', code: 7 },
+  });
+  const v = sensenova.classify(403, {}, body);
+  assert.strictEqual(v.errClass, ErrClass.CONFIG_FAULT,
+    `模型不在套餐应归为 CONFIG_FAULT（跳过渠道、不惩罚 Key），实际 ${v.errClass}`);
+});
+
+t('★★ 但真正的「Key 无权限」仍必须归 AUTH（不能被上一条覆盖过头）', () => {
+  // PERMISSION_DENIED 也可能是真的 Key 权限问题 —— 那种消息里通常是 key/token/unauthorized
+  const body = JSON.stringify({
+    error: { message: 'invalid api key: unauthorized', code: 7 },
+  });
+  const v = sensenova.classify(403, {}, body);
+  assert.strictEqual(v.errClass, ErrClass.AUTH, `真 Key 权限问题应仍是 AUTH，实际 ${v.errClass}`);
 });
 
 t('书生 404 model_not_available → CONFIG_FAULT（不是 transient）', () => {
@@ -1175,6 +1223,286 @@ t('★ 复核续期与「新绑宽限」是两重独立豁免', () => {
 t('续期配置项存在且为 3 天（用户明确要求）', () => {
   assert.strictEqual(config.keyGraceRenewMs, 3 * 24 * 3600 * 1000,
     `复核续期应为 3 天，实际 ${config.keyGraceRenewMs / 3600000} 小时`);
+});
+
+/* ============================================================
+ * ⭐ [11] 熔断预算（最多试四分之一的号）
+ * ============================================================ */
+console.log('\n[11] 熔断预算 · 「最多尝试四分之一的号」');
+
+t('★ 8 把可用 Key → 预算 2（四分之一）', () => {
+  assert.strictEqual(sched.channelBudget(8), 2);
+});
+t('★ 11 把可用 Key → 预算 3（ceil(11/4)=3）', () => {
+  assert.strictEqual(sched.channelBudget(11), 3);
+});
+t('★ 大池子被 maxAttemptsPerChannel 截断（用户硬上限）', () => {
+  assert.strictEqual(sched.channelBudget(100), config.maxAttemptsPerChannel);
+});
+t('★★ 小池子有下限：3 把 Key 仍可试 2 次（否则连换 Key 都做不到）', () => {
+  // 这是真实回归：ceil(3/4)=1 会让商汤只试 1 把就放弃，e2e 三条路由用例全落到下一渠道。
+  const b = sched.channelBudget(3);
+  assert.strictEqual(b, 2, `3 把 Key 的预算应为 2（能换一次），实际 ${b}`);
+});
+t('★ 单 Key 渠道仍可用（预算=1，不会被 clamp 成 0）', () => {
+  assert.strictEqual(sched.channelBudget(1), 1);
+});
+t('★ 池子被打掉一批时，分母跟着变小（不烧剩下那两把）', () => {
+  // 40 把的池子只剩 4 把可用 → ceil(4/4)=1 → clamp 到 2（下限）
+  // 关键：不能按"原有 40 把"算成 10，否则剩下那几把会被烧光
+  assert.ok(sched.channelBudget(4) <= 2, '池子缩水时预算必须跟着缩');
+});
+t('★ 预算永远不超过池子规模', () => {
+  for (const n of [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 20]) {
+    assert.ok(sched.channelBudget(n) <= n, `${n} 把 Key 的预算不应超过 ${n}`);
+    assert.ok(sched.channelBudget(n) >= 1, `${n} 把 Key 的预算至少 1`);
+  }
+});
+
+/* ============================================================
+ * ⭐ [12] 模型级健康度（正常 → 降级 → 不可用）
+ * ============================================================ */
+console.log('\n[12] 模型级健康度 · 「分多级，不然全池子死了」');
+const snCh = channels.getChannel('sensenova').id;
+
+t('★ 连续失败 3 次 → DEGRADED（降级，只试 1 次）', () => {
+  mh.resetModelHealth(snCh, 'm-degrade');
+  for (let i = 0; i < 2; i++) mh.recordModelFailure(snCh, 'm-degrade', ErrClass.QUOTA, 'x', 'sensenova');
+  const g1 = sched.modelGate(snCh, 'm-degrade', { channelName: 'sensenova' });
+  assert.strictEqual(g1.state, 'NORMAL', '前 2 次失败仍应正常');
+  assert.strictEqual(g1.attempts, 0, 'NORMAL 用渠道预算（0 = 不特殊限制）');
+
+  mh.recordModelFailure(snCh, 'm-degrade', ErrClass.QUOTA, 'x', 'sensenova');
+  const g2 = sched.modelGate(snCh, 'm-degrade', { channelName: 'sensenova' });
+  assert.strictEqual(g2.state, 'DEGRADED', '第 3 次失败应降级');
+  assert.strictEqual(g2.attempts, 1, '降级时只允许试 1 次');
+  assert.strictEqual(g2.allow, true, '降级仍允许参与调度');
+});
+
+t('★ 继续失败到 6 次 → UNAVAILABLE（直接跳过）', () => {
+  for (let i = 0; i < 3; i++) mh.recordModelFailure(snCh, 'm-degrade', ErrClass.QUOTA, 'x', 'sensenova');
+  const g = sched.modelGate(snCh, 'm-degrade', { channelName: 'sensenova' });
+  assert.strictEqual(g.state, 'UNAVAILABLE');
+  assert.strictEqual(g.allow, false, '不可用应默认跳过');
+  assert.strictEqual(g.attempts, 0);
+});
+
+t('★ UNAVAILABLE 兜底：全渠道都不可用时允许试 1 次（不能让请求直接失败）', () => {
+  const g = sched.modelGate(snCh, 'm-degrade', { fallback: true, channelName: 'sensenova' });
+  assert.strictEqual(g.allow, true);
+  assert.strictEqual(g.attempts, 1);
+});
+
+t('★★ 成功一次立刻回 NORMAL（成功即恢复健康）', () => {
+  mh.recordModelSuccess(snCh, 'm-degrade', 'sensenova');
+  const g = sched.modelGate(snCh, 'm-degrade', { channelName: 'sensenova' });
+  assert.strictEqual(g.state, 'NORMAL', '成功一次就该恢复');
+  const h = mh.getModelHealth(snCh, 'm-degrade', Date.now(), 'sensenova');
+  assert.strictEqual(h.fail_streak, 0, '连续失败计数应清零');
+});
+
+t('★★ AUTH 不计入模型健康度（Key 死了不连坐模型）', () => {
+  mh.resetModelHealth(snCh, 'm-auth');
+  const out = sched.applyModelFailure(snCh, 'm-auth', ErrClass.AUTH, 'invalid key', 'sensenova');
+  assert.strictEqual(out, null, 'AUTH 应被判定为"不是模型的锅"');
+  const h = mh.getModelHealth(snCh, 'm-auth', Date.now(), 'sensenova');
+  assert.strictEqual(h.fail_streak, 0, 'AUTH 不应累加模型的失败次数');
+});
+
+t('★ REQUEST_FAULT 不计入模型健康度（请求体问题不是模型的锅）', () => {
+  mh.resetModelHealth(snCh, 'm-req');
+  assert.strictEqual(sched.applyModelFailure(snCh, 'm-req', ErrClass.REQUEST_FAULT, 'bad', 'sensenova'), null);
+  assert.strictEqual(mh.getModelHealth(snCh, 'm-req', Date.now(), 'sensenova').fail_streak, 0);
+});
+
+t('★ UNAVAILABLE 到期后降到 DEGRADED 观察（不直接回 NORMAL）', () => {
+  mh.resetModelHealth(snCh, 'm-recover');
+  for (let i = 0; i < 6; i++) mh.recordModelFailure(snCh, 'm-recover', ErrClass.QUOTA, 'x', 'sensenova');
+  const h = mh.getModelHealth(snCh, 'm-recover', Date.now(), 'sensenova');
+  assert.strictEqual(h.state, 'UNAVAILABLE');
+  // 快进时钟：读侧按 after 判定 → 应显示 DEGRADED（不是 NORMAL）
+  const after = (h.disabled_until ?? Date.now()) + 1;
+  const h2 = mh.getModelHealth(snCh, 'm-recover', after, 'sensenova');
+  assert.strictEqual(h2.state, 'DEGRADED', '到期应降到 DEGRADED（不是 NORMAL）');
+  // 惰性维护真的把库里那行改掉
+  mh.reviveExpired(after);
+  const row = dbx.one('SELECT state FROM model_health WHERE channel_id=? AND model=?', snCh, 'm-recover');
+  assert.strictEqual(row.state, 'DEGRADED', '库里的状态也应被降到 DEGRADED');
+  // 降到 DEGRADED 后只试 1 次 —— 一个真坏的模型不会每 24h 又被全池子烧一轮
+  const g = sched.modelGate(snCh, 'm-recover', { channelName: 'sensenova' });
+  assert.strictEqual(g.state, 'DEGRADED');
+  assert.strictEqual(g.attempts, 1);
+});
+
+t('★ 模型健康度按 (渠道 × 模型) 隔离，互不影响', () => {
+  const itCh = channels.getChannel('intern').id;
+  mh.resetModelHealth(snCh, 'm-iso');
+  mh.resetModelHealth(itCh, 'm-iso');
+  for (let i = 0; i < 3; i++) mh.recordModelFailure(snCh, 'm-iso', ErrClass.QUOTA, 'x', 'sensenova');
+  assert.strictEqual(mh.getModelHealth(snCh, 'm-iso', Date.now(), 'sensenova').state, 'DEGRADED');
+  assert.strictEqual(mh.getModelHealth(itCh, 'm-iso', Date.now(), 'intern').state, 'NORMAL',
+    '同一模型在别的渠道不该受影响');
+});
+
+/* ============================================================
+ * ⭐ [13] 内置问题模型规则
+ * ============================================================ */
+console.log('\n[13] 内置问题模型规则 · 「组成一个内置规则」');
+
+t('★ 画图模型（商汤 u1*）被识别为「非 chat 端点」', () => {
+  assert.ok(modelRules.isNonChatModel('sensenova', 'sensenova-u1-fast'), 'sensenova-u1-fast 应识别为画图模型');
+  assert.ok(modelRules.isNonChatModel('sensenova', 'sensenova-u1.5-lite'), 'u1.5-lite 应识别为画图模型');
+  assert.ok(!modelRules.isNonChatModel('sensenova', 'glm-5.2'), 'glm-5.2 不是画图模型');
+});
+
+t('★★ 画图模型的「路径 404」不计入健康度（失效了不判真失效）', () => {
+  // 用户原话：「有些画图模型 失效了不判真失效」——
+  // 画图模型走 /v1/images/generations，用 chat 打必然 404，
+  // 那是路径不对，不是模型坏。累计 6 次也不能把它熔断。
+  mh.resetModelHealth(snCh, 'sensenova-u1-fast');
+  for (let i = 0; i < 8; i++) {
+    const out = mh.recordModelFailure(snCh, 'sensenova-u1-fast', ErrClass.CONFIG_FAULT, 'model route not found', 'sensenova');
+    assert.strictEqual(out, null, '画图模型的路径 404 应被豁免');
+  }
+  const h = mh.getModelHealth(snCh, 'sensenova-u1-fast', Date.now(), 'sensenova');
+  assert.strictEqual(h.state, 'NORMAL', '画图模型不该因 chat 404 被熔断');
+  assert.strictEqual(h.fail_streak, 0);
+});
+
+t('★ 爱 429 的模型首次见即 DEGRADED（预置，不必先烧 Key）', () => {
+  // deepseek-v4-pro 在商汤被内置规则标为"限流严格"
+  const seed = modelRules.initialModelState('sensenova', 'deepseek-v4-pro');
+  assert.strictEqual(seed.state, 'DEGRADED');
+  assert.strictEqual(seed.kind, modelRules.RuleKind.RATE_LIMIT_PRONE);
+});
+
+t('★ OpenRouter 的 :free 模型被预置为 DEGRADED', () => {
+  const seed = modelRules.initialModelState('openrouter', 'google/gemma-4-31b-it:free');
+  assert.strictEqual(seed.state, 'DEGRADED');
+});
+
+t('★ 内置规则只影响"没有记录时"的初值；有记录则运行时结论优先', () => {
+  const seedCh = channels.getChannel('sensenova').id;
+  // 预置为 DEGRADED 的模型，实际成功一次后就该回 NORMAL
+  mh.recordModelSuccess(seedCh, 'deepseek-v4-pro', 'sensenova');
+  const h = mh.getModelHealth(seedCh, 'deepseek-v4-pro', Date.now(), 'sensenova');
+  assert.strictEqual(h.state, 'NORMAL', '运行时成功的结论必须覆盖静态规则');
+  assert.strictEqual(h.fromRule, false);
+});
+
+t('★ 普通模型不受内置规则影响（保持 NORMAL）', () => {
+  const seed = modelRules.initialModelState('sensenova', 'glm-5.2');
+  assert.strictEqual(seed.state, 'NORMAL');
+});
+
+t('★ modelGate 对内置规则预置的降级模型只给 1 次机会', () => {
+  const seedCh = channels.getChannel('sensenova').id;
+  // 该模型没有任何记录 → 走内置规则
+  dbx.run('DELETE FROM model_health WHERE channel_id=? AND model=?', seedCh, 'kimi-k3');
+  const g = sched.modelGate(seedCh, 'kimi-k3', { channelName: 'sensenova' });
+  assert.strictEqual(g.state, 'DEGRADED', '内置规则应预置为降级');
+  assert.strictEqual(g.attempts, 1, '降级只试 1 次 —— 不占熔断预算');
+  assert.strictEqual(g.fromRule, true, '应标记来源是内置规则');
+});
+
+t('★ 规则可由环境变量叠加', () => {
+  const fakeCfg = { builtinModelRules: 1, rateLimitProneModels: 'my-slow-model', nonChatModels: '' };
+  const seed = modelRules.initialModelState('sensenova', 'my-slow-model', fakeCfg);
+  assert.strictEqual(seed.state, 'DEGRADED', 'env 指定的模型也应预置降级');
+});
+
+t('★ 内置规则可整体关闭（BUILTIN_MODEL_RULES=0）', () => {
+  const off = { builtinModelRules: 0, rateLimitProneModels: '', nonChatModels: '' };
+  const seed = modelRules.initialModelState('sensenova', 'deepseek-v4-pro', off);
+  assert.strictEqual(seed.state, 'NORMAL', '关掉后不该预置');
+});
+
+/* ============================================================
+ * ⭐ [14] 「最后调用的模型」+ 成功率口径
+ * ============================================================ */
+console.log('\n[14] 最后调用的模型 · 「冷却中要显示最后调用什么模型」');
+
+t('★ keyHealthMap 给出该 Key 最后调用的模型与时间', () => {
+  keys.addKey({ channel: 'sensenova', key: 'sk-lastmodel', uuid: 'u-lastmodel' });
+  const t0 = Date.now();
+  state.recordFailure('u-lastmodel', 'model-A', { action: 'soft', nextRetryAt: t0 + 60000, error: 'e' });
+  state.recordFailure('u-lastmodel', 'model-B', { action: 'soft', nextRetryAt: t0 + 60000, error: 'e' });
+  // 手工把 model-A 的 last_used_at 拨到更早，确保 model-B 是"最后一次"
+  dbx.run('UPDATE key_state SET last_used_at = ? WHERE key_uuid=? AND model=?', t0 - 10000, 'u-lastmodel', 'model-A');
+  dbx.run('UPDATE key_state SET last_used_at = ? WHERE key_uuid=? AND model=?', t0, 'u-lastmodel', 'model-B');
+
+  const h = state.keyHealthMap().get('u-lastmodel');
+  assert.strictEqual(h.lastModel, 'model-B', `最后调用的应是 model-B，实际 ${h.lastModel}`);
+  assert.ok(h.lastModelAt > 0, '应带时间戳');
+});
+
+t('★ 最后调用的模型若正处于异常 → 能指出"就是它打挂的"', () => {
+  keys.addKey({ channel: 'sensenova', key: 'sk-lastbad', uuid: 'u-lastbad' });
+  const now = Date.now();
+  state.recordFailure('u-lastbad', 'bad-model', {
+    action: 'cooldown', nextRetryAt: now + 10 * 60_000, streak: 1, error: '429',
+  });
+  const h = state.keyHealthMap().get('u-lastbad');
+  assert.strictEqual(h.lastModel, 'bad-model');
+  assert.strictEqual(h.state, 'COOLDOWN');
+  // keyHealthMap 给出该模型自己的状态
+  assert.strictEqual(h.lastModelState, 'COOLDOWN', 'keyHealthMap 应给出该模型的状态');
+  // 上层 shape() 把它折算成布尔，供前端直接渲染
+  const k = keys.getKey('u-lastbad');
+  const shaped = shapeFn(k, h, null);
+  assert.strictEqual(shaped.lastModel, 'bad-model');
+  assert.strictEqual(shaped.lastModelBad, true, '该模型异常时 lastModelBad 应为 true');
+  assert.ok(shaped.lastModelAgoMs >= 0, '应给出"多久之前"');
+});
+
+t('★ 从未被调用过的 Key：lastModel 为 null（不是空字符串）', () => {
+  keys.addKey({ channel: 'sensenova', key: 'sk-never', uuid: 'u-never' });
+  const h = state.keyHealthMap().get('u-never');
+  // 该 Key 没有 key_state 行 → 聚合里根本没有它 → undefined 也对
+  assert.ok(h === undefined || h.lastModel === null, '未调用过的 Key 不该有 lastModel');
+});
+
+t('★ last_used_at 相同的两条记录不会互相覆盖出意外结果', () => {
+  keys.addKey({ channel: 'sensenova', key: 'sk-tie', uuid: 'u-tie' });
+  const ts = Date.now();
+  state.recordFailure('u-tie', 'model-X', { action: 'soft', nextRetryAt: ts + 60000, error: 'e' });
+  state.recordFailure('u-tie', 'model-Y', { action: 'soft', nextRetryAt: ts + 60000, error: 'e' });
+  dbx.run('UPDATE key_state SET last_used_at = ? WHERE key_uuid=?', ts, 'u-tie');
+  const h = state.keyHealthMap().get('u-tie');
+  assert.ok(h.lastModel === 'model-X' || h.lastModel === 'model-Y', '时间相同时取任一都不该崩');
+});
+
+console.log('\n[15] 成功率统计（流水维度）');
+
+t('★ successRates 返回三个维度，且 ok+fail == req', () => {
+  const now = Date.now();
+  for (let i = 0; i < 6; i++) {
+    logsDb.logRequest({
+      model: 'rate-model', publicModel: 'rate-model', channelId: snCh, keyUuid: 'u-rate',
+      status: i < 4 ? 200 : 429, errClass: i < 4 ? ErrClass.OK : ErrClass.QUOTA,
+      latencyMs: 100, attempts: 1, chain: null,
+    });
+  }
+  const r = logsDb.successRates({ limit: 1000 });
+  const row = r.byModel.find((x) => x.model === 'rate-model');
+  assert.ok(row, '应能找到该模型');
+  assert.strictEqual(row.req, 6);
+  assert.strictEqual(row.ok, 4);
+  assert.strictEqual(row.fail, 2);
+  assert.strictEqual(row.ratePct, 66.7, `成功率应是 4/6=66.7%，实际 ${row.ratePct}`);
+  assert.strictEqual(row.ok + row.fail, row.req, 'ok+fail 必须等于 req');
+});
+
+t('★ 无流水的维度返回空数组（不是报错）', () => {
+  const r = logsDb.successRates({ limit: 5 });
+  assert.ok(Array.isArray(r.byModel) && Array.isArray(r.byKey) && Array.isArray(r.byChannel));
+});
+
+t('★ modelChannelRates 分解错误分类（看得出"就是爱 429"）', () => {
+  const rows = logsDb.modelChannelRates({ limit: 1000 });
+  const hit = rows.find((x) => x.upstream_model === 'rate-model');
+  assert.ok(hit, '应能找到该模型');
+  assert.strictEqual(hit.quota_fail, 2, '应统计出 2 次 quota 失败');
 });
 
 closeDb();

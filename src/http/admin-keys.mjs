@@ -52,6 +52,14 @@ function shape(k, health = null, daily = null) {
   const calledRecently = !!d && (d.ok > 0 || d.fail > 0);
   const noSuccess = !!d && d.fail > 0 && d.ok === 0;
 
+  // ⭐ 「最后一次调用的是什么模型」（用户要求）：
+  //    冷却中只显示"剩余 17 分 51 秒"是不够的 —— 还得知道是**被哪个模型打挂的**。
+  //    从 key_state（key×model 粒度、带 last_used_at）取最近那条即可。
+  const lastModel = h.lastModel ?? null;
+  const lastModelAt = h.lastModelAt ?? null;
+  // 该模型是否正处于异常（冷却/禁用）—— 让 UI 能说"就是它把 Key 打挂的"
+  const lastModelBad = lastModel ? h.lastModelState && h.lastModelState !== 'READY' : false;
+
   return {
     uuid: k.uuid,
     channel: k.channel_name,
@@ -81,6 +89,16 @@ function shape(k, health = null, daily = null) {
     cooldownModels: h.cooldownModels,
     /** 人工停用 / 自动禁用 的区分，便于 UI 给不同文案 */
     reason: !k.enabled ? 'disabled_manual' : (h.state === 'DISABLED' ? 'disabled_auto' : null),
+
+    // ---- ⭐ 最后调用的模型（用户要求：冷却中要显示出来）----
+    /** 最后一次真实上游请求打的模型名（探针也算）；从未调用过则为 null */
+    lastModel,
+    /** 那次调用的时间戳 */
+    lastModelAt,
+    /** 那个模型当前是否处于冷却/禁用（= "就是它把这把 Key 打挂的"）*/
+    lastModelBad,
+    /** 距上次调用多久（毫秒），前端渲染"3 分钟前" */
+    lastModelAgoMs: lastModelAt ? Math.max(0, now - lastModelAt) : null,
 
     // ---- 每 Key RPM 限速 ----
     rpmUsed: used,
