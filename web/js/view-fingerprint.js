@@ -57,13 +57,41 @@ async function detectStatus() {
   } catch { host.textContent = ''; }
 }
 
+/**
+ * 模型候选 —— ⭐ 选了渠道就**只列该渠道的模型**（用户 2026-10-08）。
+ * 用渠道作用域 token 去问 `/v1/models`，与"这个渠道实际能用什么"完全一致。
+ */
 async function fillModelHints() {
   const dl = $('#fpModelHints');
+  const box = $('#fpModelBox');
+  const chips = $('#fpModelChips');
+  if (box) box.hidden = true;
+  if (chips) chips.replaceChildren();
   if (!dl) return;
+  const channel = currentChannel();
   try {
-    const m = await api.models();
-    const ids = [...new Set((m.models || []).map((x) => x.id))].sort();
-    dl.replaceChildren(...ids.map((id) => el('option', { value: id })));
+    let ids = [];
+    if (channel) {
+      const r = await api.scopedModels(channel);
+      ids = [...new Set((r.models || []).map((m) => m.id))];
+      if (box) {
+        box.hidden = false;
+        box.textContent = ids.length
+          ? `该渠道可用模型 ${ids.length} 个（点下方模型名填入）：`
+          : '该渠道暂无模型（可直接手填上游模型名）。';
+      }
+      // 渠道模型做成可点的 chip —— 比 datalist 更直观
+      if (chips && ids.length) {
+        chips.replaceChildren(...ids.sort().map((id) => el('button', {
+          class: 'btn btn-sm', type: 'button', text: id,
+          onclick: () => { const inp = $('#fpModel'); if (inp) inp.value = id; },
+        })));
+      }
+    } else {
+      const m = await api.models();
+      ids = [...new Set((m.models || []).map((x) => x.id))];
+    }
+    dl.replaceChildren(...ids.sort().map((id) => el('option', { value: id })));
   } catch { /* ignore */ }
 }
 

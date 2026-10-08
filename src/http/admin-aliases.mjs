@@ -72,9 +72,13 @@ export async function handleAliases(req, res, url) {
   }
 
   if (pathname === '/api/models' && method === 'GET') {
+    // ⭐ `?channel=` → 只看该渠道的模型（用户 2026-10-08：按渠道 / 指纹页选渠道后
+    //    模型下拉框只列该渠道的模型）。用的是与"渠道作用域 token"同一套逻辑。
+    const only = url.searchParams.get('channel');
     return sendJson(res, 200, {
       object: 'list',
-      models: aliases.publicModelList(),
+      models: only ? aliases.scopedModelList(only) : aliases.publicModelList(),
+      channel: only || null,
       upstream: catalog.catalogStats(),
     });
   }

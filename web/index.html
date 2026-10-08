@@ -529,6 +529,9 @@
             <button id="btnRunFingerprint" class="btn btn-primary" type="button">开始测试</button>
           </div>
           <datalist id="fpModelHints"></datalist>
+          <p class="muted" id="fpModelBox" style="font-size:12px;margin:8px 0 0" hidden></p>
+          <!-- 该渠道可用模型（点一下填入） -->
+          <div id="fpModelChips" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px"></div>
           <p class="muted" style="font-size:12px;margin:10px 0 0">
             ⚠️ 数字指纹是<strong>参考库内的排序</strong>，不在库中的模型也会得到"最像"的候选，不是身份证明。
             复用推理链的模型（如 deepseek）会慢一些，超时给足。

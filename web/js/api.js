@@ -77,7 +77,9 @@ export const api = {
   addAlias: (payload) => request('POST', '/api/aliases', payload),
   patchAlias: (id, patch) => request('PATCH', `/api/aliases/${id}`, patch),
   deleteAlias: (id) => request('DELETE', `/api/aliases/${id}`),
-  models: () => request('GET', '/api/models'),
+  models: (channel = null) => request('GET', `/api/models${channel ? `?channel=${encodeURIComponent(channel)}` : ''}`),
+  /** 该渠道的模型（与"渠道作用域 token"同源；按渠道视图 / 指纹页用） */
+  scopedModels: (channel) => request('GET', `/api/models?channel=${encodeURIComponent(channel)}`),
   upstreamModels: () => request('GET', '/api/models/upstream'),
   fetchUpstreamModels: (channel) => request('POST', '/api/models/fetch', { channel }),
   clearUpstreamModels: (channel) => request('DELETE', channel ? `/api/models/upstream?channel=${encodeURIComponent(channel)}` : '/api/models/upstream?all=true'),
