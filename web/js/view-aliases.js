@@ -10,6 +10,7 @@ import api from './api.js';
 import {
   $, el, fmtAgo, toast, openModal, closeModal, field, confirmDialog,
 } from './ui.js';
+import { openJobModal } from './view-jobs.js';
 import { getChannels } from './view-keys.js';
 
 const state = {
@@ -63,9 +64,18 @@ function render() {
       document.createTextNode(' '),
       el('button', { class: 'btn btn-sm', type: 'button', text: '拉黑模型', onclick: () => banModelDialog(m) }),
       document.createTextNode(' '),
-      el('button', { class: 'btn btn-sm', type: 'button', text: '测试可用性', onclick: () => testAvailabilityDialog(m) }),
+      // ⭐ 左键 = 立刻开始测（弹实时进度框）；右键 = 设置超时
+      el('button', {
+        class: 'btn btn-sm', type: 'button', text: '测试可用性', title: '左键：立即测试（实时进度）；右键：设置超时',
+        onclick: (e) => testAvailability(m, e),
+        oncontextmenu: (e) => openTimeoutMenu(e, m, 'probe'),
+      }),
       document.createTextNode(' '),
-      el('button', { class: 'btn btn-sm', type: 'button', text: '测试指纹', onclick: () => testFingerprintDialog(m) }),
+      el('button', {
+        class: 'btn btn-sm', type: 'button', text: '测试指纹', title: '左键：立即测试；右键：设置超时',
+        onclick: (e) => testFingerprint(m, e),
+        oncontextmenu: (e) => openTimeoutMenu(e, m, 'fingerprint'),
+      }),
     ]),
   ])));
 }
@@ -77,92 +87,113 @@ function targetsOf(m) {
   return (m.targets || []).filter((t) => t && t.channel && t.upstream);
 }
 
-function pickTargetDialog(title, m, intro, onPick) {
+/** 当前生效的超时（秒）。右键可改，存 localStorage，按"操作类型"记。 */
+function timeoutSec(kind) {
+  const d = kind === 'fingerprint' ? 120 : 10;
+  const v = Number(localStorage.getItem(`a2a.timeout.${kind}`));
+  return Number.isFinite(v) && v >= (kind === 'fingerprint' ? 5 : 3) ? v : d;
+}
+function setTimeoutSec(kind, sec) { localStorage.setItem(`a2a.timeout.${kind}`, String(sec)); }
+
+/** 在当前模型上选一个渠道目标（多于一个时才弹；只有一个直接用） */
+function chooseTarget(m, { title, intro }, onPick) {
   const targets = targetsOf(m);
   if (!targets.length) { toast('这个模型没有可用的渠道目标（可能全被拉黑了）', 'warn'); return; }
+  if (targets.length === 1) return onPick(targets[0]);
 
-  const list = el('div', { style: 'display:flex;flex-direction:column;gap:6px' });
-  const nodes = targets.map((t) => el('button', {
+  const list = el('div', { style: 'display:flex;flex-direction:column;gap:6px' }, targets.map((t) => el('button', {
     class: 'btn', type: 'button',
     style: 'justify-content:flex-start;text-align:left',
     text: `${t.channel}  ×  ${t.upstream}`,
     onclick: () => { closeModal(true); onPick(t); },
-  }));
-  list.replaceChildren(...nodes);
-
+  })));
   openModal({ title, bodyNode: [el('p', { class: 'muted', style: 'font-size:12.5px', text: intro }), list], okText: '取消', cancelText: '关闭' });
+}
+
+/* -------- 左键：立即测试（后台任务 + 实时进度模态框） -------- */
+
+function testAvailability(m) {
+  const targets = targetsOf(m);
+  if (!targets.length) { toast('没有可测试的渠道目标', 'warn'); return; }
+  // 单目标 → 直接测该目标；多目标 → 传模型名，后端自动展开成"所有渠道一起测"
+  const spec = targets.length === 1
+    ? { channel: targets[0].channel, model: targets[0].upstream }
+    : { model: m.id };
+  startProbeJob(spec, m.id);
+}
+
+async function startProbeJob(spec, label) {
+  // 立刻开始（不等任何弹窗）；随后弹实时进度框
+  let jr;
+  try {
+    jr = await api.enqueueProbe({
+      ...spec,
+      timeoutMs: timeoutSec('probe') * 1000,
+    });
+  } catch (e) { toast(e.message, 'err', 6000); return; }
+
+  openJobModal({
+    title: `测试可用性：${label}（超时 ${timeoutSec('probe')}s/Key）`,
+    jobId: jr.job.id,
+  });
+  toast('已开始测试（关闭进度框也会在后台继续）', 'ok', 4000);
+}
+
+function testFingerprint(m) {
+  startFingerprintJob(m.id);
+}
+
+async function startFingerprintJob(model, api = 'cc') {
+  let jr;
+  try {
+    jr = await api.enqueueFingerprint({ model, api, timeoutSec: timeoutSec('fingerprint') });
+  } catch (e) { toast(e.message, 'err', 6000); return; }
+  openJobModal({ title: `测试指纹：${model}`, jobId: jr.job.id });
+}
+
+/* -------- 右键：设置超时 -------- */
+
+function openTimeoutMenu(e, m, kind) {
+  e.preventDefault();
+  e.stopPropagation();
+  const isFp = kind === 'fingerprint';
+  const cur = timeoutSec(kind);
+  const in_ = el('input', { class: 'input', type: 'number', min: isFp ? '5' : '3', value: String(cur) });
+  openModal({
+    title: `设置${isFp ? '指纹测试' : '可用性测试'}超时`,
+    bodyNode: [
+      el('p', { class: 'muted', style: 'font-size:12.5px', text: isFp
+        ? '指纹要模型写几百个随机数，推理模型会慢一些，建议 120 秒以上。'
+        : '每个 Key 等"首字"的最长时间。默认 10 秒。' }),
+      field(`${isFp ? '单次' : '每个 Key '}超时（秒）`, in_, '保存后立即用于下一次左键测试'),
+    ],
+    okText: '保存',
+    onOk: () => {
+      const v = Number(in_.value);
+      if (!Number.isFinite(v) || v < (isFp ? 5 : 3)) { toast('超时太短', 'warn'); return false; }
+      setTimeoutSec(kind, v);
+      toast(`已设置：${v} 秒`, 'ok');
+    },
+  });
 }
 
 function banModelDialog(m) {
   if (!targetsOf(m).length) { toast('没有可拉黑的渠道目标', 'warn'); return; }
-  pickTargetDialog('拉黑模型（选择渠道）', m,
-    '拉黑的是「原始渠道名 + 原始上游模型名」。该组合将不再出现在下游模型清单、也不再被尝试。', (t) => {
-      const reasonIn = el('input', { class: 'input', placeholder: '为什么拉黑（用户可见）', value: '手动拉黑（从模型页）' });
-      openModal({
-        title: `拉黑 ${t.channel} / ${t.upstream}`,
-        bodyNode: [field('原因', reasonIn, '会展示给用户，说明为什么拉黑')],
-        okText: '加入黑名单',
-        onOk: async () => {
-          await api.banModel({ channel: t.channel, model: t.upstream, reason: reasonIn.value.trim() || '手动拉黑' });
-          toast('已加入黑名单', 'ok');
-          await loadAliases();
-        },
-      });
+  chooseTarget(m, {
+    title: '拉黑模型（选择渠道）',
+    intro: '拉黑的是「原始渠道名 + 原始上游模型名」。该组合将不再出现在下游模型清单、也不再被尝试。',
+  }, (t) => {
+    const reasonIn = el('input', { class: 'input', placeholder: '为什么拉黑（用户可见）', value: '手动拉黑（从模型页）' });
+    openModal({
+      title: `拉黑 ${t.channel} / ${t.upstream}`,
+      bodyNode: [field('原因', reasonIn, '会展示给用户，说明为什么拉黑')],
+      okText: '加入黑名单',
+      onOk: async () => {
+        await api.banModel({ channel: t.channel, model: t.upstream, reason: reasonIn.value.trim() || '手动拉黑' });
+        toast('已加入黑名单', 'ok');
+        await loadAliases();
+      },
     });
-}
-
-function testAvailabilityDialog(m) {
-  if (!targetsOf(m).length) { toast('没有可测试的渠道目标', 'warn'); return; }
-  pickTargetDialog('测试可用性（选择渠道）', m,
-    '会把这个 (渠道, 模型) 在该渠道的**所有 Key** 上各打一次（每个 Key 默认 10 秒超时）。'
-    + '全部失败会自动拉黑；可在「后台任务管理」看进度。', (t) => {
-      const toIn = el('input', { class: 'input', type: 'number', value: '10', min: '3' });
-      const bgIn = el('input', { class: 'input', type: 'checkbox' });
-      const bgWrap = el('label', { style: 'display:flex;align-items:center;gap:8px;font-size:13px' }, [
-        bgIn, el('span', { text: '放到后台跑（推荐，可在「后台任务管理」看进度）' }),
-      ]);
-      openModal({
-        title: `测试可用性：${t.channel} / ${t.upstream}`,
-        bodyNode: [field('每个 Key 超时（秒）', toIn, '默认 10 秒'), bgWrap],
-        okText: '开始',
-        onOk: async () => {
-          const timeoutSec = Math.max(3, Number(toIn.value) || 10);
-          if (bgIn.checked) {
-            await api.enqueueProbe({ channel: t.channel, model: t.upstream, timeoutMs: timeoutSec * 1000 });
-            toast('已提交后台任务（可在「后台任务管理」查看）', 'ok', 5000);
-          } else {
-            toast('正在测试，请稍候…', 'info', 2500);
-            const r = await api.probeModel({ channel: t.channel, model: t.upstream, timeoutMs: timeoutSec * 1000 });
-            toast(r.allFailed ? `全部 ${r.total} 个 Key 失败${r.banned ? '，已自动拉黑' : ''}` : `${r.okCount}/${r.total} 个 Key 成功`, r.allFailed ? 'warn' : 'ok', 6000);
-            await loadAliases();
-          }
-        },
-      });
-    });
-}
-
-function testFingerprintDialog(m) {
-  const in_ = el('input', { class: 'input', value: m.id, autocomplete: 'off' });
-  const apiSel = el('select', { class: 'input' }, [
-    el('option', { value: 'cc', text: 'Chat Completions' }),
-    el('option', { value: 'responses', text: 'Responses' }),
-    el('option', { value: 'message', text: 'Anthropic Messages' }),
-  ]);
-  openModal({
-    title: '测试模型指纹',
-    bodyNode: [
-      field('模型名（网关对外名即可）', in_, '会用 lm-detector 让模型写随机数，识别背后真实模型'),
-      field('协议', apiSel, '多数渠道用 Chat Completions'),
-    ],
-    okText: '后台测试',
-    onOk: async () => {
-      const model = in_.value.trim();
-      if (!model) { toast('模型名必填', 'warn'); return false; }
-      try {
-        await api.enqueueFingerprint({ model, api: apiSel.value });
-        toast('已提交指纹测试任务，请到「指纹测试」页或「后台任务管理」看结果', 'ok', 6000);
-      } catch (e) { toast(e.message, 'err', 6000); return false; }
-    },
   });
 }
 

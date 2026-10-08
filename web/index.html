@@ -33,7 +33,7 @@
     <button class="tab" type="button" data-view="probe">测活</button>
     <button class="tab" type="button" data-view="stats">观测</button>
     <button class="tab" type="button" data-view="blacklist">模型黑名单</button>
-    <button class="tab" type="button" data-view="jobs">后台任务管理</button>
+    <button class="tab" type="button" data-view="jobs">任务管理</button>
     <button class="tab" type="button" data-view="fingerprint">指纹测试</button>
     <button class="tab" type="button" data-view="settings">设置</button>
   </nav>
@@ -439,13 +439,13 @@
       </div>
     </section>
 
-    <!-- 视图：后台任务管理（用户 2026-10-08 要求：与黑名单一样独立导航页） -->
+    <!-- 视图：任务管理（用户 2026-10-08 要求：独立导航页） -->
     <section class="view" id="view-jobs">
       <div class="view-head">
-        <h2>后台任务管理</h2>
+        <h2>任务管理</h2>
         <p class="view-desc">
-          可用性测试与指纹测试都在<strong>后台跑</strong>，这里实时看进度。
-          <strong>关闭浏览器不影响进度</strong> —— 任务在服务端执行，回来再看还在。
+          可用性测试与指纹测试都在服务端跑，这里实时看进度。
+          <strong>关闭浏览器不影响进度</strong>。
         </p>
       </div>
 
@@ -480,14 +480,14 @@
       </div>
     </section>
 
-    <!-- 视图：指纹测试（用户 2026-10-08 要求：独立导航页，后台跑） -->
+    <!-- 视图：指纹测试（用户 2026-10-08 要求：独立导航页） -->
     <section class="view" id="view-fingerprint">
       <div class="view-head">
         <h2>指纹测试</h2>
         <p class="view-desc">
           用 <code>lm-detector</code> 让模型写一串随机数，识别 API 背后<strong>到底是哪个模型</strong>。
           请求经本网关 <code>/v1</code> 发出，用的是网关里配的上游 Key。
-          测试在<strong>后台</strong>跑，这里实时看进度，<strong>关闭浏览器不影响</strong>。
+          测试在服务端跑，这里实时看进度，<strong>关闭浏览器不影响</strong>。
         </p>
       </div>
 
@@ -519,7 +519,7 @@
               <span class="field-label">单次超时（秒）</span>
               <input id="fpTimeout" class="input" type="number" min="5" value="120">
             </label>
-            <button id="btnRunFingerprint" class="btn btn-primary" type="button">开始测试（后台）</button>
+            <button id="btnRunFingerprint" class="btn btn-primary" type="button">开始测试</button>
           </div>
           <datalist id="fpModelHints"></datalist>
           <p class="muted" style="font-size:12px;margin:10px 0 0">

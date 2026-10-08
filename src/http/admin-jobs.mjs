@@ -18,7 +18,36 @@ import { enqueueJob, cancelJob, isRunning } from '../jobs/runner.mjs';
 import * as fp from '../jobs/fingerprint.mjs';
 import { probeModelAvailability } from '../jobs/probe.mjs';
 import { getChannel } from '../db/channels.mjs';
+import { listChannelModels } from '../db/catalog.mjs';
+import { resolveCandidates } from '../db/aliases.mjs';
 import { readJson, sendJson, matchPath, HttpError } from './util.mjs';
+
+/**
+ * 给定一个（对外）模型名，展开成"提供它的所有 (渠道, 原始上游模型名)"目标。
+ * 走 resolveCandidates —— 它已经处理了归并/映射/同名直通。
+ */
+function targetsForModel(publicName) {
+  const seen = new Set();
+  const out = [];
+  const all = resolveCandidates(publicName);
+  for (const c of all) {
+    const key = `${c.channelName}|${c.upstreamName}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    // 只保留"目录里确实有它"或"有渠道专属/全局映射"的目标，
+    // 避免把一堆必然 404 的渠道也拉进来（测试会白等一堆超时）
+    const inCatalog = listChannelModels(c.channelId).some((m) => m.model_id === c.upstreamName);
+    if (c.rank <= 1 || inCatalog) out.push({ channel: c.channelName, model: c.upstreamName });
+  }
+  // 兜底：一个都没筛出来时用全部候选
+  if (!out.length) for (const c of all) out.push({ channel: c.channelName, model: c.upstreamName });
+  return out;
+}
+
+function cleanModelName(fallback, targets) {
+  if (fallback) return fallback;
+  return targets.length === 1 ? targets[0].model : '多个目标';
+}
 
 export async function handleJobs(req, res, url) {
   const { pathname } = url;
@@ -43,21 +72,36 @@ export async function handleJobs(req, res, url) {
   }
 
   // ---- 建任务：可用性 ----
+  // 接受 {channel, model}（单目标）或 {model}（自动展开该模型所有渠道目标）
+  // 或 {targets:[{channel,model},...]}（显式多目标）。
   if (pathname === '/api/jobs/probe' && method === 'POST') {
     const body = await readJson(req);
-    const chRef = body?.channel;
-    const model = String(body?.model ?? '').trim();
-    if (!chRef) throw new HttpError(400, '需要 channel');
-    if (!model) throw new HttpError(400, '需要 model');
-    const ch = getChannel(chRef);
-    if (!ch) throw new HttpError(404, `渠道不存在: ${chRef}`);
+    let targets = [];
+    if (Array.isArray(body?.targets) && body.targets.length) {
+      targets = body.targets.map((t) => ({ channel: t.channel, model: String(t.model ?? '').trim() }));
+    } else if (body?.channel && body?.model) {
+      targets = [{ channel: body.channel, model: String(body.model).trim() }];
+    } else if (body?.model) {
+      // 只给了模型名 → 自动展开成"提供它的所有渠道目标"
+      targets = targetsForModel(String(body.model).trim());
+    }
+    if (!targets.length) throw new HttpError(400, '需要 targets / channel+model / model');
+    for (const t of targets) {
+      if (!t.channel) throw new HttpError(400, 'target.channel 必填');
+      if (!t.model) throw new HttpError(400, 'target.model 必填');
+      if (!getChannel(t.channel)) throw new HttpError(404, `渠道不存在: ${t.channel}`);
+    }
+    const title = targets.length === 1
+      ? `测可用性：${getChannel(targets[0].channel).display_name} / ${targets[0].model}`
+      : `测可用性：${cleanModelName(body?.model, targets)}（${targets.length} 个渠道）`;
     const job = enqueueJob({
       kind: JobKind.PROBE,
-      title: `测可用性：${ch.display_name} / ${model}`,
+      title,
       spec: {
-        channel: ch.name, model,
+        targets,
         timeoutMs: body?.timeoutMs ?? null,
         gapMs: body?.gapMs ?? null,
+        autoBan: body?.autoBan ?? null,
       },
       total: 0,
     });

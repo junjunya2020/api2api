@@ -9,7 +9,7 @@
  * 关掉浏览器 = 停止轮询；服务端的任务照跑，回来再看还在。
  */
 import api from './api.js';
-import { $, el, fmtAgo, fmtMs, toast, confirmDialog } from './ui.js';
+import { $, el, fmtAgo, fmtMs, toast, confirmDialog, openModal, closeModal } from './ui.js';
 
 const KIND_LABEL = { probe: '测可用性', fingerprint: '测指纹' };
 const STATUS_META = {
@@ -28,9 +28,6 @@ export function statusPill(status) {
 const STEP_CLS = {
   pending: 'muted', running: 'pill-warn', ok: 'pill-ok', fail: 'pill-err', skip: 'muted',
 };
-
-let poller = null;
-let watchedId = null;
 
 /** 挂载「后台任务管理」面板（黑名单页 / 指纹页都用） */
 export function initJobsPanel({ hostId, kind = null, onJobClick = null }) {
@@ -143,35 +140,82 @@ async function removeJob(j) {
   } catch (e) { toast(e.message, 'err'); }
 }
 
-/* -------------------------------------------------- 实时进度（单任务） */
+/* -------------------------------------------------- 实时进度（可多路） */
 
-/** 在一个容器里实时渲染某个任务的进度（自动轮询，离开页面时 stop） */
-export function watchJob(jobId, host, { onDone = null } = {}) {
-  stopWatch();
-  watchedId = jobId;
+/**
+ * 轮询表：`jobId → {timer, host}`。
+ * ⚠️ 必须支持**多路** —— 进度模态框、后台任务页、指纹页可能同时在看任务。
+ *    早期单例实现会出现"打开 B 就把 A 的轮询停掉"。
+ */
+const watchers = new Map();
+
+/** 在一个容器里实时渲染某个任务的进度（自动轮询）@returns {Function} 停止函数 */
+export function watchJob(jobId, host, { onDone = null, onTick = null } = {}) {
+  stopWatch(jobId);
+  const rec = { host, timer: null, stopped: false };
+  watchers.set(jobId, rec);
+
   const tick = async () => {
-    if (watchedId !== jobId) return;
+    if (rec.stopped) return;
     try {
       const { job } = await api.job(jobId);
+      if (rec.stopped) return;
       renderJobDetail(host, job);
+      if (onTick) onTick(job);
       if (job.status === 'running' || job.status === 'queued') {
-        poller = setTimeout(tick, 1200);
+        rec.timer = setTimeout(tick, 1200);
       } else {
-        poller = null;
+        rec.timer = null;
         if (onDone) onDone(job);
       }
     } catch (e) {
+      if (rec.stopped) return;
       host.replaceChildren(el('div', { class: 'muted', text: `读取任务失败：${e.message}` }));
-      poller = setTimeout(tick, 2500);
+      rec.timer = setTimeout(tick, 2500);
     }
   };
   tick();
-  return stopWatch;
+
+  return () => stopWatch(jobId);
 }
 
-export function stopWatch() {
-  if (poller) { clearTimeout(poller); poller = null; }
-  watchedId = null;
+/** 停止某任务的轮询；不传 id 则停全部 */
+export function stopWatch(jobId = undefined) {
+  const stop = (id) => {
+    const rec = watchers.get(id);
+    if (!rec) return;
+    rec.stopped = true;
+    if (rec.timer) clearTimeout(rec.timer);
+    watchers.delete(id);
+  };
+  if (jobId === undefined) { for (const id of [...watchers.keys()]) stop(id); return; }
+  stop(jobId);
+}
+
+/**
+ * ⭐ 打开一个**实时进度模态框**（用户 2026-10-08 要求）：
+ *   「点击测试可用性应该马上开始测试啊 模态框实时显示进度 …… 关闭后仍然在后台测试」
+ *
+ * 关闭模态框只停轮询 —— 任务本身在服务端照跑，可去「后台任务管理」继续看。
+ */
+export function openJobModal({ title, jobId, onClose = null }) {
+  const host = el('div');
+  const hint = el('div', {
+    class: 'field-hint',
+    style: 'margin-top:12px',
+    text: '关闭这个窗口不影响测试 —— 任务在后台继续跑，可随时到「后台任务管理」查看。',
+  });
+  const p = openModal({
+    title,
+    bodyNode: [host, hint],
+    okText: '后台运行',
+    cancelText: '收起',
+    onOk: () => { /* 只是收起 */ },
+  });
+  watchJob(jobId, host);
+  // 模态框关闭 → 停轮询（任务继续）
+  p.then(() => { stopWatch(jobId); if (onClose) onClose(); });
+  return () => { stopWatch(jobId); closeModal(true); };
 }
 
 /** 渲染任务详情：进度条 + 每个步骤的状态 + 最终结果 */
@@ -295,5 +339,5 @@ export function renderProbeResult(r) {
 
 export default {
   initJobsPanel, renderJobsInto, watchJob, stopWatch, renderJobDetail,
-  renderFingerprintResult, renderProbeResult, statusPill,
+  renderFingerprintResult, renderProbeResult, statusPill, openJobModal,
 };

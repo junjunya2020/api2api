@@ -99,64 +99,95 @@ async function runJob(job) {
 
 async function runProbeJob(job, isCancelled) {
   const spec = job.spec || {};
-  const ch = getChannel(spec.channel);
-  if (!ch) throw new Error(`渠道不存在: ${spec.channel}`);
-  const model = String(spec.model || '').trim();
-  if (!model) throw new Error('spec.model 必填');
+  // 支持两种形态：
+  //   {channel, model}                    单目标（黑名单条目用）
+  //   {targets:[{channel,model}, ...]}    多目标（模型页"点一下全测"用）
+  const targets = Array.isArray(spec.targets) && spec.targets.length
+    ? spec.targets
+    : [{ channel: spec.channel, model: spec.model }];
 
   const timeoutMs = Math.max(1000, Number(spec.timeoutMs) || config.probeModelTimeoutMs);
   const gapMs = Math.max(0, Number(spec.gapMs) ?? 1200);
 
-  const keys = listKeys({ channel: ch.id, enabledOnly: true });
-  jobsDb.patchJob(job.id, { total: keys.length });
+  // 先把所有目标的 Key 摊平，算出总步数（进度条才有意义）
+  const plan = targets.map((t) => {
+    const ch = getChannel(t.channel);
+    if (!ch) throw new Error(`渠道不存在: ${t.channel}`);
+    const model = String(t.model || '').trim();
+    if (!model) throw new Error('model 必填');
+    return { ch, model, keys: listKeys({ channel: ch.id, enabledOnly: true }) };
+  }).filter((p) => p.keys.length);
+  if (!plan.length) throw new Error('没有可测的 (渠道,模型) 目标（渠道下没有启用的 Key）');
 
-  const steps = keys.map((k) => ({ label: `Key ${k.name || k.uuid}`, state: 'pending' }));
-  const writer = jobsDb.makeProgressWriter(job.id, { initialTotal: keys.length });
+  const totalKeys = plan.reduce((n, p) => n + p.keys.length, 0);
+  jobsDb.patchJob(job.id, { total: totalKeys });
+
+  const steps = [];
+  const indexOf = new Map();   // `${channel}::${model}::${keyUuid}` → step index
+  for (const p of plan) {
+    for (const k of p.keys) {
+      indexOf.set(`${p.ch.name}::${p.model}::${k.uuid}`, steps.length);
+      steps.push({ label: `${p.ch.display_name} · ${k.name || k.uuid}`, state: 'pending' });
+    }
+  }
+  const writer = jobsDb.makeProgressWriter(job.id, { initialTotal: totalKeys });
+  writer.setTotal(totalKeys);
   writer.setSteps(steps);
-  writer.setTotal(keys.length);
 
-  const results = [];
-  let ok = 0;
-  let fail = 0;
-
-  const out = await probe.probeModelAvailability({
-    channel: ch.name,
-    model,
-    timeoutMs,
-    gapMs,
-    cancel: isCancelled,
-    onKey: (info) => {
-      const idx = info.index;
-      steps[idx] = {
-        label: `Key ${info.keyName || info.key}`,
-        state: info.state === 'ok' ? 'ok' : (info.state === 'skip' ? 'skip' : 'fail'),
-        detail: info.state === 'ok'
-          ? `HTTP ${info.httpStatus} · ${info.ms}ms`
-          : `${info.message} · ${info.ms}ms`,
-        ms: info.ms,
-      };
-      if (info.state === 'ok') ok++; else if (info.state === 'fail') fail++;
-      results.push({ key: info.key, keyName: info.keyName, ...info });
-      writer.setSteps(steps);
-      writer.bump({ doneDelta: 1, okDelta: info.state === 'ok' ? 1 : 0, failDelta: info.state === 'fail' ? 1 : 0 });
-    },
-  });
-
-  writer.setSteps(steps);
-  writer.flush(true);
-  jobsDb.patchJob(job.id, {
-    result: {
-      channel: ch.name, channelDisplay: ch.display_name, model,
-      total: keys.length, okCount: out.okCount, failCount: out.failCount,
+  const perTarget = [];
+  for (const p of plan) {
+    if (isCancelled()) break;
+    const out = await probe.probeModelAvailability({
+      channel: p.ch.name,
+      model: p.model,
+      timeoutMs,
+      gapMs,
+      cancel: isCancelled,
+      onKey: (info) => {
+        const idx = indexOf.get(`${p.ch.name}::${p.model}::${info.key}`);
+        if (idx !== undefined) {
+          steps[idx] = {
+            label: `${p.ch.display_name} · ${info.keyName || info.key} · ${p.model}`,
+            state: info.state === 'ok' ? 'ok' : (info.state === 'skip' ? 'skip' : 'fail'),
+            detail: info.state === 'ok'
+              ? `HTTP ${info.httpStatus} · ${info.ms}ms`
+              : `${info.message} · ${info.ms}ms`,
+            ms: info.ms,
+          };
+          writer.setSteps(steps);
+        }
+        writer.bump({
+          doneDelta: 1,
+          okDelta: info.state === 'ok' ? 1 : 0,
+          failDelta: info.state === 'fail' ? 1 : 0,
+        });
+      },
+    });
+    perTarget.push({
+      channel: p.ch.name, channelDisplay: p.ch.display_name, model: p.model,
+      total: out.total, okCount: out.okCount, failCount: out.failCount,
       allFailed: out.allFailed, banned: out.banned,
       results: out.results.map((r) => ({
         key: r.key, keyName: r.keyName, state: r.state, httpStatus: r.httpStatus ?? null,
         ms: r.ms ?? null, errClass: r.errClass ?? null, message: r.message ?? null,
       })),
-    },
-    // 单 Key 任务请忽略；这里只是让 FAILED 的 Key 计数好看
-    okCount: out.okCount, failCount: out.failCount,
-  });
+    });
+  }
+
+  writer.setSteps(steps);
+  writer.flush(true);
+  const okCount = perTarget.reduce((n, t) => n + t.okCount, 0);
+  const failCount = perTarget.reduce((n, t) => n + t.failCount, 0);
+  const banned = perTarget.filter((t) => t.banned).map((t) => ({ channel: t.channel, model: t.model }));
+
+  // 单目标时保持扁平结构（前端/黑名单页按单目标渲染），多目标时给 targets[]
+  const result = perTarget.length === 1
+    ? { ...perTarget[0] }
+    : {
+      multi: true, targets: perTarget, okCount, failCount,
+      allFailed: perTarget.every((t) => t.allFailed), banned,
+    };
+  jobsDb.patchJob(job.id, { result, okCount, failCount });
 }
 
 /* ------------------------------------------------------------ 指纹 */
