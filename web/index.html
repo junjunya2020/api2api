@@ -32,6 +32,7 @@
     <button class="tab" type="button" data-view="channels">渠道</button>
     <button class="tab" type="button" data-view="probe">测活</button>
     <button class="tab" type="button" data-view="stats">观测</button>
+    <button class="tab" type="button" data-view="blacklist">模型黑名单</button>
     <button class="tab" type="button" data-view="settings">设置</button>
   </nav>
 
@@ -402,14 +403,37 @@
         <div class="panel-head"><h3>调度设置</h3></div>
         <div class="panel-body" id="settingsBody"></div>
       </div>
+    </section>
 
-      <!-- ⭐ 模型黑名单（用户 2026-10-08）：原始渠道名 + 原始上游模型名 -->
+    <!-- 视图：模型黑名单（用户 2026-10-08 要求：独立导航页） -->
+    <section class="view" id="view-blacklist">
+      <div class="view-head">
+        <h2>模型黑名单</h2>
+        <p class="view-desc">
+          被拉黑的是 <strong>原始渠道名称 + 原始上游模型名称</strong>（不是对外名、不是转换后的名字）。
+          拉黑后它<strong>不再出现在模型清单里</strong>，转发时<strong>一次请求都不会发</strong>；每条都能看到<strong>为什么拉黑</strong>。
+        </p>
+      </div>
+
       <div class="panel">
         <div class="panel-head">
-          <h3>模型黑名单设置</h3>
-          <span class="muted" style="font-size:12px">被拉黑的不再出现在模型清单里，也不再被尝试</span>
+          <h3>黑名单设置</h3>
+          <span class="muted" style="font-size:12px">改完立即生效，无需重启</span>
         </div>
-        <div class="panel-body" id="blacklistBody"></div>
+        <div class="panel-body" id="blacklistToggles"></div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h3>已拉黑（原始渠道 × 原始上游模型）</h3>
+          <div class="panel-actions">
+            <button id="btnSyncFastBans" class="btn btn-ghost" type="button">重算「快速模式」拉黑</button>
+            <button id="btnAddBan" class="btn btn-primary" type="button">+ 手动加入</button>
+          </div>
+        </div>
+        <div class="panel-body" id="blacklistSummary"></div>
+        <div id="blacklistBody"></div>
+        <div class="empty" id="blacklistEmpty" hidden>黑名单为空。</div>
       </div>
     </section>
 

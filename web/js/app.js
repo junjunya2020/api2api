@@ -9,6 +9,7 @@ import aliasesView from './view-aliases.js';
 import channelsView from './view-channels.js';
 import probeView from './view-probe.js';
 import statsView from './view-stats.js';
+import blacklistView from './view-blacklist.js';
 import settingsView from './view-settings.js';
 
 /** 视图注册表：名称 → 加载函数 */
@@ -41,6 +42,9 @@ const views = {
       }
     }
     await statsView.loadStats();
+  },
+  blacklist: async () => {
+    await blacklistView.loadBlacklist();
   },
   settings: async () => {
     await settingsView.loadSettings();
@@ -127,6 +131,7 @@ function main() {
   channelsView.initChannelsView();
   probeView.initProbeView();
   statsView.initStatsView();
+  blacklistView.initBlacklistView();
   settingsView.initSettingsView();
 
   $('#btnRefresh').addEventListener('click', refresh);
