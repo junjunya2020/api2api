@@ -5,6 +5,7 @@
 import { all, one, run } from './index.mjs';
 import { getChannel } from './channels.mjs';
 import { catalogMap } from './catalog.mjs';
+import { aliasMap, canonicalOf, groupMembers } from './synonyms.mjs';
 
 export class BadRequestError extends Error {
   constructor(msg) { super(msg); this.name = 'BadRequestError'; this.status = 400; }
@@ -85,6 +86,18 @@ export function deleteAlias(id) {
  * 只排序、不剔除 —— 目录可能为空或过期，剔除会造成"明明能调却调不到"。
  */
 export function resolveCandidates(publicName) {
+  // ⭐ 归并层（用户 2026-10-08）：别名 → 规范名。
+  //   下游调 `DeepSeek-V4-Flash-0731` / `deepseek-v4-flash:0731` 等任一别名时，
+  //   先重定向到规范名 `deepseek-v4-flash`，再按规范名解析候选 ——
+  //   于是"任意一个别名"都能路由到**所有**真的提供该模型的渠道。
+  //   ⚠️ 未命中归并表时 canonicalOf 原样返回，行为与改动前完全一致。
+  const canonical = canonicalOf(publicName);
+  // 同组名字（规范名 + 所有别名）—— 用户可能给每个渠道各建一条渠道专属映射，
+  // 各自的 public_name 不同，必须并起来查才不会漏渠道。
+  const members = groupMembers(canonical);
+  const memberSet = new Set(members);
+  const inClause = members.map(() => '?').join(',');
+
   const chans = all(`
     SELECT id AS channel_id, name AS channel_name, display_name AS channel_display,
            adapter, base_url, sort_order
@@ -92,22 +105,27 @@ export function resolveCandidates(publicName) {
   `);
   if (!chans.length) return [];
 
-  // 该对外名下的所有映射
+  // 同组名字下的所有映射（含别名各自的映射 —— 归并后它们共享候选）
   const aliasRows = all(`
-    SELECT a.upstream_name, a.channel_id, a.priority, a.weight
-    FROM model_alias a WHERE a.public_name = ? AND a.enabled = 1
-  `, publicName);
+    SELECT a.upstream_name, a.channel_id, a.priority, a.weight, a.public_name
+    FROM model_alias a WHERE a.public_name IN (${inClause}) AND a.enabled = 1
+  `, ...members);
   const chanSpecific = new Map();
   let globalAlias = null;
   for (const a of aliasRows) {
-    if (a.channel_id) chanSpecific.set(a.channel_id, a);
-    else if (!globalAlias || a.priority > globalAlias.priority) globalAlias = a;
+    if (a.channel_id) {
+      const cur = chanSpecific.get(a.channel_id);
+      // 同渠道多条时取 priority 高的（同名组内竞争）
+      if (!cur || (a.priority ?? 0) > (cur.priority ?? 0)) chanSpecific.set(a.channel_id, a);
+    } else if (!globalAlias || a.priority > globalAlias.priority) {
+      globalAlias = a;
+    }
   }
 
-  // 目录里确实有这个名字的渠道
+  // 目录里确实有这些名字的渠道（同一组名都算命中）
   const known = new Set(
     all(`SELECT DISTINCT c.name AS channel_name FROM upstream_model u
-         JOIN channel c ON c.id = u.channel_id WHERE u.model_id = ?`, publicName)
+         JOIN channel c ON c.id = u.channel_id WHERE u.model_id IN (${inClause})`, ...members)
       .map((r) => r.channel_name),
   );
 
@@ -173,18 +191,21 @@ function normalize(r) {
  *   ① 上游有的模型，原样出现在列表里（同名直通，下游可直接用）
  *   ② 上游模型若被映射改名，对应上游名会被"折叠"掉，只留对外名
  *   ③ 映射到的上游名即使不在目录里也照样列出（用户可能故意映射到目录外的模型）
+ *   ④ ⭐ 归并：别名（`DeepSeek-V4-Flash-0731` 等）**不再单独列出**，折叠到规范名
+ *   ⑤ ⭐ 黑名单：被拉黑的 (渠道 × 原始上游模型) 从清单里**彻底消失**
  *
  * 这样下游 /v1/models 看到的 = "我实际能调到的所有模型"，
  * 而不是"必须先手工建映射才看得到"。
  */
 export function publicModelList() {
-  const catalog = catalogMap();          // model_id → { channels, ... }
+  const catalog = catalogMap();          // model_id → { channels, channelNames, ... }
   const aliases = all(`
     SELECT a.public_name, a.upstream_name, a.channel_id, a.enabled,
            c.name AS channel_name, c.display_name AS channel_display
     FROM model_alias a LEFT JOIN channel c ON c.id = a.channel_id
     WHERE a.enabled = 1
   `);
+  const syn = aliasMap();                // 别名 → 规范名
 
   /** 被某个映射"占用"的 (上游名, 渠道) —— 折叠时用，避免同一个东西出现两次 */
   const claimedByChannel = new Map();    // `${channelName}|${upstream}` → publicName
@@ -197,17 +218,25 @@ export function publicModelList() {
     }
   }
 
+  /** ⭐ 黑名单：${channelName}|${原始上游模型名} → 整条 (渠道,模型) 不再可见 */
+  const banned = bannedChannelModels();
+
   const out = new Map();  // publicId → entry
 
-  // ① 上游目录：未被映射占用的模型，以原名出现在列表（同名直通）
+  // ① 上游目录：未被映射占用、且未被拉黑的模型，以原名出现在列表（同名直通）
   for (const [modelId, entry] of catalog) {
+    // 归并别名：整体折叠，改名到规范名（规范名条目在下面单独合成）
+    if (syn.byName.has(modelId) && !syn.canonicals.has(modelId)) continue;
+
     // 全局映射：该上游名整体改名，原名不再出现
     if (claimedGlobal.has(modelId)) continue;
 
     // 渠道专属映射：只把"被占用的那些渠道"摘掉，其余渠道的原名仍可见
+    // 同时按渠道摘掉被拉黑的那些（用户要求：拉黑的不在模型列表出现）
     const keptIdx = entry.channelNames
       .map((chName, i) => (claimedByChannel.has(`${chName}|${modelId}`) ? -1 : i))
-      .filter((i) => i >= 0);
+      .filter((i) => i >= 0)
+      .filter((i) => !banned.has(`${entry.channelNames[i]}|${modelId}`));
     if (!keptIdx.length) continue;
 
     out.set(modelId, {
@@ -220,6 +249,7 @@ export function publicModelList() {
 
   // ② 映射：作为对外名列出（去重）
   for (const a of aliases) {
+    if (syn.byName.has(a.public_name) && !syn.canonicals.has(a.public_name)) continue;
     const channels = a.channel_name
       ? [a.channel_display || a.channel_name]
       : [...catalog.get(a.upstream_name)?.channels ?? []];
@@ -236,7 +266,60 @@ export function publicModelList() {
     });
   }
 
+  // ③ ⭐ 规范名自身：合成一条"归并名"条目。
+  //    渠道取自"该组名字真的落在哪些渠道"（目录命中 ∪ 渠道专属映射），
+  //    **不是** resolveCandidates 的全渠道 —— 否则会把 OpenRouter/NVIDIA 这种
+  //    根本不提供该模型的渠道也列出来，误导下游。
+  for (const canonical of syn.canonicals) {
+    const aliasNames = [...syn.byName.entries()]
+      .filter(([, c]) => c === canonical).map(([n]) => n);
+    const members = new Set([canonical, ...aliasNames]);
+
+    const chans = [];
+    const addChan = (name) => { if (name && !chans.includes(name)) chans.push(name); };
+    for (const [modelId, entry] of catalog) {
+      if (!members.has(modelId)) continue;
+      for (let i = 0; i < entry.channelNames.length; i++) {
+        if (banned.has(`${entry.channelNames[i]}|${modelId}`)) continue;
+        addChan(entry.channels[i]);
+      }
+    }
+    for (const a of aliases) {
+      if (!members.has(a.public_name) || !a.channel_name) continue;
+      if (banned.has(`${a.channel_name}|${a.upstream_name}`)) continue;
+      addChan(a.channel_display || a.channel_name);
+    }
+
+    if (out.has(canonical)) {
+      // 规范名本身也是上游模型名（很常见）→ 升级为归并条目，便于下游识别
+      const e = out.get(canonical);
+      e.kind = 'synonym';
+      e.aliases = aliasNames;
+      e.channels = [...new Set([...e.channels, ...chans])];
+      e.aliasedFrom = aliasNames[0] ?? e.aliasedFrom;
+      continue;
+    }
+    out.set(canonical, {
+      id: canonical,
+      kind: 'synonym',
+      channels: chans,
+      aliasedFrom: aliasNames[0] ?? null,
+      /** 额外的非标准字段：这名字归并了哪些别名（便于 UI 说明） */
+      aliases: aliasNames,
+    });
+  }
+
   return [...out.values()].sort((x, y) => x.id.localeCompare(y.id));
+}
+
+/**
+ * 黑名单查询（渠道名 × 原始上游模型名）。
+ * 单独抽出来是为了让 aliases.mjs 不依赖 channel-ban 的内部结构。
+ */
+function bannedChannelModels() {
+  const rows = all(`SELECT c.name AS channel_name, b.model AS model
+                    FROM model_blacklist b JOIN channel c ON c.id = b.channel_id`);
+  return new Set(rows.map((r) => `${r.channel_name}|${r.model}`));
 }
 
 export default { listAliases, addAlias, patchAlias, deleteAlias, resolveCandidates, publicModelList };

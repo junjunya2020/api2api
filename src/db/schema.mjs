@@ -129,6 +129,56 @@ CREATE TABLE IF NOT EXISTS model_alias (
 );
 CREATE INDEX IF NOT EXISTS idx_alias_public ON model_alias(public_name, enabled, priority DESC);
 
+-- 模型名归并（同义名 → 规范名）。
+--
+-- ⭐ 为什么需要（用户 2026-10-08 要求）：
+--   「DeepSeek-V4-Flash-0731 / deepseek-v4-flash-0731 / Deepseek-V4-Flash /
+--     deepseek-v4-flash:0731 都映射成 deepseek-v4-flash」
+--   同一个模型在不同渠道的上游名千奇百怪（大小写 / 版本后缀 / ':0731' 标签 /
+--    供应商前缀），下游只想记一个名字。这里把「别名 → 规范名」落库：
+--     · 调用任一别名 → 先重定向到规范名，再走正常的跨渠道路由
+--     · 别名本身**不再单独出现在下游模型清单里**（折叠掉，避免重复）
+--
+--   ⚠️ 与 model_alias 的区别：
+--     model_alias 是「**对外名 → 上游名**」，回答"这个名字在这条渠道上叫啥"；
+--     model_synonym 是「**别名 → 规范名**」，回答"这两个名字是不是同一个东西"。
+--     前者管渠道内改名，后者管全局归并。两者叠加，互不替代。
+CREATE TABLE IF NOT EXISTS model_synonym (
+  name       TEXT PRIMARY KEY,
+  canonical  TEXT NOT NULL,
+  note       TEXT,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_syn_canonical ON model_synonym(canonical);
+
+-- ⭐ 模型黑名单（原始渠道 × 原始上游模型）。
+--
+-- 用户要求（2026-10-08）：
+--   「连续失败过多的模型+渠道自动禁用 比如一个模型 从来没成功过 每次调用都失败
+--     不在在模型列表出现」
+--   「加入的是原始渠道名称+原始上游模型名称 不是转换后的名称」
+--   「之前确定用不了的模型就直接拉黑了 让用户能看到 为什么拉黑」
+--
+-- 与 model_health 的区别（两者互补，不能互相替代）：
+--   model_health  三级、运行时学到、**24h 后自动降级观察**（会自己回来）
+--   model_blacklist **永久**（只能手动解禁）、有明确理由、**从模型清单里彻底消失**
+--                 并且不是"少试几次"，而是**直接不发请求**。
+--
+-- 键 = (channel_id, model)：展示时用 channel.name（原始渠道名）+ model（原始上游名）。
+CREATE TABLE IF NOT EXISTS model_blacklist (
+  channel_id TEXT NOT NULL REFERENCES channel(id) ON DELETE CASCADE,
+  model      TEXT NOT NULL,
+  reason     TEXT,
+  -- builtin = 内置"已确定用不了"名单  fast-mode = 快速模式未收录
+  -- auto    = 连续失败自动加入        manual   = 人工加入
+  source     TEXT NOT NULL DEFAULT 'manual',
+  fail_count INTEGER NOT NULL DEFAULT 0,
+  ok_count   INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (channel_id, model)
+);
+
 -- 下游客户端 token（只存 sha256）
 CREATE TABLE IF NOT EXISTS client_token (
   token_hash TEXT PRIMARY KEY,

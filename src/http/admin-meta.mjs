@@ -18,6 +18,7 @@ import * as tokens from '../db/tokens.mjs';
 import * as logs from '../db/logs.mjs';
 import * as state from '../db/state.mjs';
 import * as settings from '../db/settings.mjs';
+import * as blacklist from '../db/channel-ban.mjs';
 import { keyStats } from '../db/keys.mjs';
 import { publicModelList } from '../db/aliases.mjs';
 import { adapterIds } from '../adapters/index.mjs';
@@ -50,11 +51,38 @@ export async function handleMeta(req, res, url) {
   }
   if (pathname === '/api/settings' && method === 'PATCH') {
     const body = await readJson(req);
+    const out = {};
+    const changed = [];
+
     if (body && body.fastModelsOnly !== undefined) {
-      const next = settings.setFastModelsOnly(!!body.fastModelsOnly);
-      return sendJson(res, 200, { ok: true, settings: settings.allSettings(), fastModelsOnly: next });
+      out.fastModelsOnly = settings.setFastModelsOnly(!!body.fastModelsOnly);
+      changed.push('fastModelsOnly');
+      // ⭐ 快速模式开关变更 → 同步 fast-mode 拉黑（NVIDIA 未收录模型）。
+      //    开 → 未收录的拉黑；关 → 移除 fast-mode 拉黑。用户要求「nvidia 那些模型
+      //    开启了快速模式后就默认拉黑」。
+      //
+      //    ⚠️ 这里扫的是**当前目录**，所以只能覆盖"目录里还在、但不在白名单里"的
+      //       残留。新拉目录时被白名单挡掉的模型**根本不会入库** ——
+      //       那部分由 `/api/models/fetch` 在过滤的当下直接 `banMany` 落黑名单。
+      //       两处配合才能做到「快速模式收录之外的都拉黑」。
+      try {
+        out.fastModeSync = blacklist.applyFastModeBans(out.fastModelsOnly);
+      } catch (e) {
+        out.fastModeSync = { error: e.message };
+      }
     }
-    throw new HttpError(400, '没有可更新的字段（支持 fastModelsOnly）');
+    if (body && body.blacklistEnabled !== undefined) {
+      out.blacklistEnabled = settings.setBlacklistEnabled(!!body.blacklistEnabled);
+      changed.push('blacklistEnabled');
+    }
+    if (body && body.autoBlacklistEnabled !== undefined) {
+      out.autoBlacklistEnabled = settings.setAutoBlacklistEnabled(!!body.autoBlacklistEnabled);
+      changed.push('autoBlacklistEnabled');
+    }
+    if (!changed.length) {
+      throw new HttpError(400, '没有可更新的字段（支持 fastModelsOnly / blacklistEnabled / autoBlacklistEnabled）');
+    }
+    return sendJson(res, 200, { ok: true, changed, settings: settings.allSettings(), ...out });
   }
 
   // 渠道优先级整体重排：前端拖拽后一次性提交完整顺序。

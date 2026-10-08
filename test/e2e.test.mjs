@@ -782,6 +782,92 @@ await ta('没有任何 Key 的 owner → allFailed 为 false（不是"全失效"
   assert.strictEqual(r.json.keys.length, 0);
 });
 
+/* ---------- [10] ⭐ 模型黑名单 / 归并 的 relay 级拦截 ---------- */
+
+console.log('\n[10] 模型黑名单与归并（relay 级）');
+
+const synonymsDb = await import('../src/db/synonyms.mjs');
+const banDb = await import('../src/db/channel-ban.mjs');
+const settingsDb2 = await import('../src/db/settings.mjs');
+
+await ta('★ 候选渠道全被拉黑 → 直接拒绝，一次上游请求都不发', async () => {
+  const sn = channelsDb.getChannel('sensenova');
+  const it = channelsDb.getChannel('intern');
+  // e2e 里只有这两家配了 Key，且把该模型都放进目录 → 两家都是候选；
+  // 两家都拉黑 → 候选全灭 → 应 4xx 且零请求。
+  // （若只拉黑一家，剩下一家会走「目录全没有 → 回退全试」的兜底，仍会真打一次 ——
+  //   那是**故意**的设计，本用例只验证"全被拉黑"这条路径。）
+  catalog.replaceChannelModels(sn.id, ['blacklist-test-model']);
+  catalog.replaceChannelModels(it.id, ['blacklist-test-model']);
+  banDb.ban({ channel: 'sensenova', model: 'blacklist-test-model', reason: '测试拉黑' });
+  banDb.ban({ channel: 'intern', model: 'blacklist-test-model', reason: '测试拉黑' });
+  snBehavior.calls.length = 0;
+  itBehavior.calls.length = 0;
+  try {
+    const r = await chat({ model: 'blacklist-test-model', messages: [{ role: 'user', content: 'hi' }] });
+    assert.ok(r.status >= 400, `应报错，实际 ${r.status}`);
+    assert.strictEqual(snBehavior.calls.length, 0, `被拉黑不该发请求，实际 ${snBehavior.calls.length} 次`);
+    assert.strictEqual(itBehavior.calls.length, 0, '被拉黑不该发请求');
+  } finally {
+    banDb.unban({ channel: 'sensenova', model: 'blacklist-test-model' });
+    banDb.unban({ channel: 'intern', model: 'blacklist-test-model' });
+  }
+});
+
+await ta('★ 被拉黑的渠道不发请求，但其他渠道的同名模型照常可用', async () => {
+  const sn = channelsDb.getChannel('sensenova');
+  const it = channelsDb.getChannel('intern');
+  catalog.replaceChannelModels(sn.id, ['blacklist-test-model']);
+  catalog.replaceChannelModels(it.id, ['blacklist-test-model']);
+  banDb.ban({ channel: 'sensenova', model: 'blacklist-test-model', reason: '只在商汤拉黑' });
+  snBehavior.calls.length = 0;
+  itBehavior.calls.length = 0;
+  try {
+    const r = await chat({ model: 'blacklist-test-model', messages: [{ role: 'user', content: 'hi' }] });
+    assert.strictEqual(r.status, 200, `书生仍可用，实际 ${r.status}`);
+    assert.strictEqual(snBehavior.calls.length, 0, '商汤被拉黑，不该被打');
+    assert.ok(itBehavior.calls.length > 0, '应落到书生');
+  } finally {
+    banDb.unban({ channel: 'sensenova', model: 'blacklist-test-model' });
+  }
+});
+
+await ta('解禁后同一模型可正常调用（黑名单不残留）', async () => {
+  const sn = channelsDb.getChannel('sensenova');
+  catalog.replaceChannelModels(sn.id, ['blacklist-test-model']);
+  snBehavior.calls.length = 0;
+  const r = await chat({ model: 'blacklist-test-model', messages: [{ role: 'user', content: 'hi' }] });
+  assert.strictEqual(r.status, 200, `解禁后应成功，实际 ${r.status}`);
+  assert.ok(snBehavior.calls.length > 0);
+});
+
+await ta('黑名单总开关关闭时不拦截（只记录）', async () => {
+  const sn = channelsDb.getChannel('sensenova');
+  catalog.replaceChannelModels(sn.id, ['blacklist-test-model']);
+  banDb.ban({ channel: 'sensenova', model: 'blacklist-test-model', reason: '测试' });
+  settingsDb2.setBlacklistEnabled(false);
+  snBehavior.calls.length = 0;
+  try {
+    const r = await chat({ model: 'blacklist-test-model', messages: [{ role: 'user', content: 'hi' }] });
+    assert.strictEqual(r.status, 200, `关闭黑名单后应可调用，实际 ${r.status}`);
+    assert.ok(snBehavior.calls.length > 0);
+  } finally {
+    settingsDb2.setBlacklistEnabled(true);
+    banDb.unban({ channel: 'sensenova', model: 'blacklist-test-model' });
+  }
+});
+
+await ta('★ 归并：用别名调用 → 路由到规范名对应的上游', async () => {
+  const it = channelsDb.getChannel('intern');
+  const sn = channelsDb.getChannel('sensenova');
+  catalog.replaceChannelModels(it.id, ['deepseek-v4-flash']);
+  catalog.replaceChannelModels(sn.id, ['something-else']);
+  synonymsDb.addSynonym({ name: 'DeepSeek-V4-Flash-0731', canonical: 'deepseek-v4-flash' });
+  itBehavior.calls.length = 0;
+  const r = await chat({ model: 'DeepSeek-V4-Flash-0731', messages: [{ role: 'user', content: 'hi' }] });
+  assert.strictEqual(r.status, 200, `别名应能调通，实际 ${r.status}`);
+});
+
 /* ---------- 清理 ---------- */
 srv.kill('SIGTERM');
 closeDb();

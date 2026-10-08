@@ -30,6 +30,7 @@
  */
 import { all, one, run } from './index.mjs';
 import { initialModelState, isNonChatModel } from './model-rules.mjs';
+import { maybeAutoBan } from './channel-ban.mjs';
 import config from '../config.mjs';
 import log from '../util/log.mjs';
 
@@ -209,6 +210,21 @@ export function recordModelFailure(channelId, model, errClass, errorMsg = null, 
     log.warn(`[model-health] ${channelId}/${model} 连续失败 ${streak} 次 → ${nextState}`
       + (action === 'unavailable' ? `（${Math.round(config.modelDisabledRecoverMs / 3600000)} 小时后自动观察）` : ''));
   }
+
+  // ⭐ 自动拉黑（用户 2026-10-08）：「连续失败过多的模型+渠道自动禁用，
+  //    比如一个模型 从来没成功过 每次调用都失败」。
+  //    判据 = 从未成功过 && 累计失败 ≥ 阈值（见 channel-ban.maybeAutoBan）。
+  //    ⚠️ 失败不影响本次返回；黑名单只是**额外**的永久层。
+  try {
+    const ab = maybeAutoBan(channelId, model, channelName);
+    if (ab.banned) {
+      return { state: nextState, action: 'blacklist', failStreak: streak, prevState: prev.state,
+        until: null, banned: true, reason: ab.reason };
+    }
+  } catch (e) {
+    log.warn(`[model-health] 自动拉黑判定失败 ${channelId}/${model}: ${e.message}`);
+  }
+
   return { state: nextState, action, failStreak: streak, prevState: prev.state,
     until: nextState === ModelState.UNAVAILABLE ? disabledUntil : cooldownUntil };
 }

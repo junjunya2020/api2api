@@ -51,6 +51,13 @@ export class ModelScopeAdapter extends BaseAdapter {
         errClass = ErrClass.QUOTA;
       } else if (/not found|no such model|model_not_found|does not exist/.test(s)) {
         errClass = ErrClass.CONFIG_FAULT;
+      } else if (/invalid model|model id|model.*(invalid|unknown|not exist)/.test(s)) {
+        // ⚠️ 「Invalid model id」= 这个模型 ModelScope 没有 → **CONFIG_FAULT**（跳过渠道继续下一个）。
+        //    曾落到下面的 `invalid` → REQUEST_FAULT（不换渠道、直接返回）→
+        //    一个"根本没在这里"的模型会在 ModelScope 被掐断，走不到真正有它的渠道。
+        //    实测 2026-10-08：`nvidia/riva-translate-4b-instruct` 在此返回
+        //    400「Invalid model id: ...」→ 整条请求 400（前几家都是 404 可继续）。
+        errClass = ErrClass.CONFIG_FAULT;
       } else if (/context|invalid|max_tokens|unsupported/.test(s)) {
         errClass = ErrClass.REQUEST_FAULT;
       }

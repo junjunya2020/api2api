@@ -9,7 +9,7 @@ import {
 } from './ui.js';
 
 export async function loadStats() {
-  const [s, st, lg, mh, rates] = await Promise.all([
+  const [s, st, lg, mh, rates, ban] = await Promise.all([
     api.stats(),
     api.states($('#stateFilterChannel')?.value || undefined),
     api.logs(Number($('#logLimit')?.value) || 100),
@@ -18,15 +18,54 @@ export async function loadStats() {
       state: $('#mhFilterState')?.value || undefined,
     }).catch(() => ({ models: [], summary: [] })),
     api.rates(Number($('#rateLimit')?.value) || 5000).catch(() => ({ byModel: [], byKey: [], byChannel: [] })),
+    api.blacklist().catch(() => ({ banned: [] })),
   ]);
   renderStatCards(s);
   renderModelHealth(mh);
   renderRates(rates);
+  renderBanSummary(ban);
   renderChannelStats(s);
   renderErrClasses(s);
   renderStates(st);
   renderLogs(lg);
   tickCountdowns();   // 共用倒计时器（ui.js）
+}
+
+/* ============================================================
+ * ⭐ 模型黑名单概览（按渠道统计；明细在设置页）
+ * ============================================================ */
+
+function renderBanSummary(ban) {
+  const host = $('#banStatBody');
+  if (!host) return;
+  const rows = ban?.banned || [];
+  if (!rows.length) {
+    host.replaceChildren(el('span', { class: 'muted', text: '黑名单为空。' }));
+    return;
+  }
+  // 按渠道聚合
+  const byCh = new Map();
+  for (const b of rows) {
+    const k = b.channel;
+    if (!byCh.has(k)) byCh.set(k, { display: b.channelDisplay || b.channel, name: k, items: [] });
+    byCh.get(k).items.push(b);
+  }
+  const chips = [...byCh.values()].map((g) => el('span', {
+    class: 'chip chip-count',
+    title: g.items.map((x) => `${x.model}（${x.sourceLabel}）`).join('\n'),
+  }, [
+    `${g.display} `,
+    el('b', { class: 'chip-err', text: String(g.items.length) }),
+  ]));
+  host.replaceChildren(
+    el('div', { style: 'display:flex;flex-wrap:wrap;gap:6px' }, chips),
+    el('div', {
+      class: 'muted',
+      style: 'font-size:12px;margin-top:8px',
+      text: `共 ${rows.length} 条被拉黑 —— 它们不会出现在下游模型清单里，也不会被尝试。`
+        + '详情与解禁：设置 →「模型黑名单设置」。',
+    }),
+  );
 }
 
 /* ============================================================

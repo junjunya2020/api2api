@@ -1677,6 +1677,229 @@ t('★ LLM7 也不在「快速模型」过滤范围内（免费档模型本就�
   assert.strictEqual(fast.isFastOnlyChannel('llm7'), false);
 });
 
+/* ============================================================
+ * [30] ⭐ 模型归并（同义名 → 规范名）—— 用户 2026-10-08
+ * ============================================================ */
+const syn = await import('../src/db/synonyms.mjs');
+const ban = await import('../src/db/channel-ban.mjs');
+const settingsDb = await import('../src/db/settings.mjs');
+
+console.log('\n[30] 模型归并（同义名 → 规范名）');
+
+t('归并：别名解析被重定向到规范名', () => {
+  syn.addSynonym({ name: 'DeepSeek-V4-Flash-0731', canonical: 'deepseek-v4-flash' });
+  assert.strictEqual(syn.canonicalOf('DeepSeek-V4-Flash-0731'), 'deepseek-v4-flash');
+  // 大小写不敏感
+  assert.strictEqual(syn.canonicalOf('deepseek-v4-flash-0731'), 'deepseek-v4-flash');
+  // 规范名自身原样返回
+  assert.strictEqual(syn.canonicalOf('deepseek-v4-flash'), 'deepseek-v4-flash');
+  // 没配过的不受影响
+  assert.strictEqual(syn.canonicalOf('glm-5.2'), 'glm-5.2');
+});
+
+t('归并：resolveCandidates 走规范名的候选', () => {
+  catalog.replaceChannelModels(channels.getChannel('intern').id, ['deepseek-v4-flash']);
+  const c = aliases.resolveCandidates('DeepSeek-V4-Flash-0731');
+  assert.ok(c.length > 0, '别名应能解析出候选');
+  assert.ok(c.some((x) => x.channelName === 'intern'), '应命中书生那条同名直通');
+});
+
+t('归并：别名不再单独出现在对外清单，只留规范名', () => {
+  const ids = aliases.publicModelList().map((x) => x.id);
+  assert.ok(ids.includes('deepseek-v4-flash'), `规范名应在，实际: ${ids.join(',')}`);
+  assert.ok(!ids.includes('DeepSeek-V4-Flash-0731'), '别名应被折叠');
+});
+
+t('归并：同规范名下多个别名一起折叠', () => {
+  syn.addSynonym({ name: 'deepseek-v4-flash:0731', canonical: 'deepseek-v4-flash' });
+  syn.addSynonym({ name: 'Deepseek-V4-Flash', canonical: 'deepseek-v4-flash' });
+  const ids = aliases.publicModelList().map((x) => x.id);
+  assert.ok(!ids.includes('deepseek-v4-flash:0731'));
+  assert.ok(!ids.includes('Deepseek-V4-Flash'));
+  const entry = aliases.publicModelList().find((x) => x.id === 'deepseek-v4-flash');
+  assert.strictEqual(entry.kind, 'synonym');
+  assert.ok(entry.aliases.length >= 3, `应记录全部别名，实际 ${JSON.stringify(entry.aliases)}`);
+});
+
+t('归并：别名与规范名完全相同被拒（仅大小写不同是合法的）', () => {
+  assert.throws(() => syn.addSynonym({ name: 'x', canonical: 'x' }), /相同/);
+});
+
+t('归并：删除后别名恢复为独立条目', () => {
+  syn.deleteSynonym('Deepseek-V4-Flash');
+  assert.strictEqual(syn.canonicalOf('Deepseek-V4-Flash'), 'Deepseek-V4-Flash');
+});
+
+/* ============================================================
+ * [31] ⭐ 模型黑名单（原始渠道 × 原始上游模型）—— 用户 2026-10-08
+ * ============================================================ */
+
+console.log('\n[31] 模型黑名单');
+
+t('内置"已确定用不了"名单已播种（商汤 6 个）', () => {
+  const rows = ban.listBanned({ channel: 'sensenova' });
+  const models = rows.map((r) => r.model).sort();
+  assert.deepStrictEqual(models, [
+    'deepseek-flash', 'deepseek-v4-pro', 'deepseek-v4.1-flash',
+    'kimi-k3', 'sensenova-u1-fast', 'sensenova-u1.5-lite',
+  ]);
+  assert.ok(rows.every((r) => r.reason && r.reason.length > 10), '每条都要有可读理由（用户要求）');
+});
+
+t('黑名单键 = 原始渠道名 + 原始上游模型名', () => {
+  const r = ban.ban({ channel: 'intern', model: 'bad-model-xyz', reason: '测试' });
+  assert.strictEqual(r.channel, 'intern');
+  assert.strictEqual(r.model, 'bad-model-xyz');
+  assert.ok(ban.isBanned('intern', 'bad-model-xyz'));
+  assert.ok(!ban.isBanned('sensenova', 'bad-model-xyz'), '同模型在别的渠道不受影响');
+});
+
+t('被拉黑的 (渠道,模型) 从对外清单里消失', () => {
+  const it = channels.getChannel('intern').id;
+  catalog.replaceChannelModels(it, ['good-model-abc', 'bad-model-xyz']);
+  const ids = aliases.publicModelList().map((x) => x.id);
+  assert.ok(ids.includes('good-model-abc'), '未拉黑的应在');
+  assert.ok(!ids.includes('bad-model-xyz'), `被拉黑的不应出现，实际: ${ids.join(',')}`);
+});
+
+t('黑名单幂等：重复加入不报错、只更新理由', () => {
+  ban.ban({ channel: 'intern', model: 'bad-model-xyz', reason: '第二次' });
+  const rows = ban.listBanned({ channel: 'intern' });
+  assert.strictEqual(rows.filter((r) => r.model === 'bad-model-xyz').length, 1);
+  assert.strictEqual(rows.find((r) => r.model === 'bad-model-xyz').reason, '第二次');
+});
+
+t('解禁后重新出现在清单里', () => {
+  ban.unban({ channel: 'intern', model: 'bad-model-xyz' });
+  assert.ok(!ban.isBanned('intern', 'bad-model-xyz'));
+  const ids = aliases.publicModelList().map((x) => x.id);
+  assert.ok(ids.includes('bad-model-xyz'), '解禁后应重新可见');
+});
+
+t('bannedPairSet 给出 `${channelId}::${model}` 集合（relay 用）', () => {
+  const set = ban.bannedPairSet();
+  const sn = channels.getChannel('sensenova').id;
+  assert.ok(set.has(`${sn}::kimi-k3`));
+});
+
+t('★ 自动拉黑：从未成功过 && 累计失败达阈值 → 自动加入', () => {
+  const it = channels.getChannel('intern').id;
+  const model = 'never-ok-model';
+  settingsDb.setAutoBlacklistEnabled(true);
+  for (let i = 0; i < 10; i++) {
+    mh.recordModelFailure(it, model, 'quota', 'boom', 'intern');
+  }
+  assert.ok(ban.isBanned('intern', model), '从未成功 + 失败 10 次 应被自动拉黑');
+  const row = ban.listBanned({ channel: 'intern' }).find((r) => r.model === model);
+  assert.strictEqual(row.source, 'auto');
+  assert.match(row.reason, /从未成功/);
+});
+
+t('★ 自动拉黑：成功过一次就不拉黑（失败率高交给健康度熔断）', () => {
+  const it = channels.getChannel('intern').id;
+  const model = 'sometimes-ok-model';
+  mh.recordModelSuccess(it, model, 'intern');
+  for (let i = 0; i < 15; i++) {
+    mh.recordModelFailure(it, model, 'quota', 'boom', 'intern');
+  }
+  assert.ok(!ban.isBanned('intern', model), '成功过就不该被永久拉黑');
+});
+
+t('自动拉黑开关关闭时不加入', () => {
+  const it = channels.getChannel('intern').id;
+  const model = 'autoban-off-model';
+  settingsDb.setAutoBlacklistEnabled(false);
+  for (let i = 0; i < 12; i++) mh.recordModelFailure(it, model, 'quota', 'boom', 'intern');
+  assert.ok(!ban.isBanned('intern', model));
+  settingsDb.setAutoBlacklistEnabled(true);
+});
+
+t('★ 快速模式：NVIDIA 未收录模型默认拉黑；关掉开关则移除', () => {
+  const nv = channels.getChannel('nvidia');
+  assert.ok(nv, 'nvidia 渠道应存在');
+  catalog.replaceChannelModels(nv.id, ['definitely-not-fast-model', 'nvidia/nemotron-3-super-120b-a12b']);
+  let r = ban.applyFastModeBans(true);
+  assert.ok(r.added >= 1, '应把未收录的拉黑');
+  assert.ok(ban.isBanned('nvidia', 'definitely-not-fast-model'));
+  assert.ok(!ban.isBanned('nvidia', 'nvidia/nemotron-3-super-120b-a12b'), '白名单内的不拉黑');
+
+  r = ban.applyFastModeBans(false);
+  assert.ok(r.removed >= 1, '关掉开关应移除 fast-mode 拉黑');
+  assert.ok(!ban.isBanned('nvidia', 'definitely-not-fast-model'));
+});
+
+t('黑名单不影响内置来源：重算 fast-mode 不动 builtin', () => {
+  ban.applyFastModeBans(true);
+  ban.applyFastModeBans(false);
+  assert.ok(ban.isBanned('sensenova', 'kimi-k3'), 'builtin 记录必须保留');
+});
+
+t('黑名单来源枚举完整（前端筛选用）', () => {
+  const labels = Object.keys(ban.SOURCE_LABEL).sort();
+  assert.deepStrictEqual(labels, ['auto', 'builtin', 'fast-mode', 'manual']);
+});
+
+t('★ banMany：批量拉黑（拉目录时被快速白名单挡掉的模型用这条路径）', () => {
+  const nv = channels.getChannel('nvidia');
+  const r = ban.banMany({
+    channel: 'nvidia',
+    models: ['a/slow-1', 'a/slow-2', 'a/slow-3'],
+    reason: '快速模式未收录：测试',
+    source: 'fast-mode',
+  });
+  assert.strictEqual(r.added, 3);
+  assert.ok(ban.isBanned('nvidia', 'a/slow-1'));
+  // 幂等：再来一次不再新增
+  assert.strictEqual(ban.banMany({
+    channel: 'nvidia', models: ['a/slow-1', 'a/slow-2'], reason: 'x', source: 'fast-mode',
+  }).added, 0);
+  return nv;
+});
+
+const orAdapterMod = (await import('../src/adapters/openrouter.mjs')).default;
+
+await ta('★ OpenRouter 400「is not a valid model ID」→ CONFIG_FAULT（跳过渠道，不是 request_fault）', () => {
+  const v = orAdapterMod.classify(400, {}, JSON.stringify({
+    error: { message: 'nvidia/riva-translate-4b-instruct is not a valid model ID', code: 400 },
+  }));
+  assert.strictEqual(v.errClass, ErrClass.CONFIG_FAULT, `实际 ${v.errClass}`);
+});
+
+t('OpenRouter 400 纯参数错仍归 REQUEST_FAULT（不换渠道）', () => {
+  const v = orAdapterMod.classify(400, {}, JSON.stringify({
+    error: { message: 'invalid parameter: temperature must be <= 2', code: 400 },
+  }));
+  assert.strictEqual(v.errClass, ErrClass.REQUEST_FAULT, `实际 ${v.errClass}`);
+});
+
+t('★ ModelScope 400「Invalid model id」→ CONFIG_FAULT（跳过渠道，不是 request_fault）', () => {
+  const v = msAdapter.classify(400, {}, JSON.stringify({
+    error: { message: 'Invalid model id: nvidia/riva-translate-4b-instruct' },
+  }));
+  assert.strictEqual(v.errClass, ErrClass.CONFIG_FAULT, `实际 ${v.errClass}`);
+});
+
+t('ModelScope 400 真参数错仍归 REQUEST_FAULT', () => {
+  const v = msAdapter.classify(400, {}, JSON.stringify({
+    error: { message: 'invalid max_tokens: must be >= 1' },
+  }));
+  assert.strictEqual(v.errClass, ErrClass.REQUEST_FAULT, `实际 ${v.errClass}`);
+});
+
+t('设置项：黑名单总开关 / 自动加入 默认打开', () => {
+  const s = settingsDb.allSettings();
+  assert.strictEqual(s.blacklistEnabled, true);
+  assert.strictEqual(s.autoBlacklistEnabled, true);
+  assert.ok(s.autoBanAfterFails >= 1);
+});
+
+t('设置项：可切换并持久化', () => {
+  settingsDb.setBlacklistEnabled(false);
+  assert.strictEqual(settingsDb.blacklistEnabled(), false);
+  settingsDb.setBlacklistEnabled(true);
+  assert.strictEqual(settingsDb.blacklistEnabled(), true);
+});
+
 closeDb();
 fs.rmSync(TMP, { recursive: true, force: true });
 

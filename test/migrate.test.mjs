@@ -203,5 +203,34 @@ await t('迁移后 renewGrace 能正常写入并被 keysWithNoSuccess 认可', (
   assert.ok(until > now);
 });
 
+/* ---------------- ⭐ 2026-10-08：归并 / 黑名单 两张新表 ---------------- */
+
+await t('老库启动后新增 model_synonym 表（别名 → 规范名）', () => {
+  const cols = all('PRAGMA table_info(model_synonym)').map((c) => c.name);
+  assert.deepStrictEqual(cols.sort(), ['canonical', 'created_at', 'name', 'note']);
+});
+
+await t('老库启动后新增 model_blacklist 表（原始渠道 × 原始上游模型）', () => {
+  const cols = all('PRAGMA table_info(model_blacklist)').map((c) => c.name);
+  for (const c of ['channel_id', 'model', 'reason', 'source', 'fail_count', 'ok_count']) {
+    assert.ok(cols.includes(c), `缺列 ${c}，实际 ${cols.join(',')}`);
+  }
+});
+
+await t('内置"已确定用不了"名单在**老库**上也会播种', async () => {
+  const banMod = await import('../src/db/channel-ban.mjs');
+  const rows = banMod.listBanned({ channel: 'sensenova' });
+  assert.strictEqual(rows.length, 6, `老库也要播 6 条，实际 ${rows.length}`);
+  assert.ok(rows.every((r) => r.reason && r.reason.length > 10), '每条都要有可读理由');
+});
+
+await t('归并表在老库上可正常读写', async () => {
+  const synMod = await import('../src/db/synonyms.mjs');
+  synMod.addSynonym({ name: 'DeepSeek-V4-Flash-0731', canonical: 'deepseek-v4-flash' });
+  assert.strictEqual(synMod.canonicalOf('DeepSeek-V4-Flash-0731'), 'deepseek-v4-flash');
+  synMod.deleteSynonym('DeepSeek-V4-Flash-0731');
+  assert.strictEqual(synMod.canonicalOf('DeepSeek-V4-Flash-0731'), 'DeepSeek-V4-Flash-0731');
+});
+
 console.log(`\n=== 迁移测试结果：${pass} 通过 / ${fail} 失败 ===\n`);
 process.exit(fail ? 1 : 0);

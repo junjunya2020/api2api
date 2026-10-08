@@ -16,20 +16,24 @@ const state = {
   aliases: [],
   downstream: [],
   upstreamGroups: [],
+  synonyms: [],
 };
 
 export async function loadAliases() {
-  const [a, m, u] = await Promise.all([
+  const [a, m, u, s] = await Promise.all([
     api.listAliases(),
     api.models(),
     api.upstreamModels ? api.upstreamModels() : Promise.resolve({ groups: [] }),
+    api.synonyms ? api.synonyms() : Promise.resolve({ synonyms: [] }),
   ]);
   state.aliases = a.aliases || [];
   state.downstream = m.models || [];
   state.upstreamGroups = u.groups || [];
+  state.synonyms = s.synonyms || [];
   render();
   renderCatalog();
   renderAliases();
+  renderSynonyms();
 }
 
 /* ---------------- ① 下游可用模型 ---------------- */
@@ -49,7 +53,7 @@ function render() {
 
   tbody.replaceChildren(...rows.map((m) => el('tr', {}, [
     el('td', {}, [el('span', { class: 'uuid-cell', text: m.id })]),
-    el('td', {}, [sourceBadge(m.kind, m.aliasedFrom)]),
+    el('td', {}, [sourceBadge(m.kind, m.aliasedFrom, m)]),
     el('td', {}, (m.channels || []).length
       ? (m.channels || []).map((c) => el('span', { class: 'pill pill-idle', text: c, style: 'margin-right:4px' }))
       : [el('span', { class: 'muted', text: '—' })]),
@@ -66,12 +70,20 @@ function render() {
   ])));
 }
 
-function sourceBadge(kind, aliasedFrom) {
+function sourceBadge(kind, aliasedFrom, m) {
   if (kind === 'alias') {
     return el('span', { class: 'pill pill-accent', text: `改名自 ${aliasedFrom}` });
   }
   if (kind === 'alias-global') {
     return el('span', { class: 'pill pill-accent', text: `全局改名自 ${aliasedFrom}` });
+  }
+  if (kind === 'synonym') {
+    const n = (m?.aliases || []).length;
+    return el('span', {
+      class: 'pill pill-info',
+      text: n ? `归并名（合并了 ${n} 个别名）` : '归并名',
+      title: (m?.aliases || []).join('、'),
+    });
   }
   return el('span', { class: 'pill pill-ok', text: '上游原名' });
 }
@@ -284,6 +296,82 @@ async function clearCatalog() {
   } catch (e) { toast(e.message, 'err'); }
 }
 
+/* ---------------- ③b 模型归并（别名 → 规范名） ---------------- */
+
+function renderSynonyms() {
+  const tbody = $('#synonymTbody');
+  const empty = $('#synonymEmpty');
+  if (!tbody) return;
+  const rows = state.synonyms;
+
+  if (!rows.length) {
+    tbody.replaceChildren();
+    if (empty) empty.hidden = false;
+    return;
+  }
+  if (empty) empty.hidden = true;
+
+  tbody.replaceChildren(...rows.map((s) => el('tr', {}, [
+    el('td', {}, [el('span', { class: 'uuid-cell', text: s.name })]),
+    el('td', {}, [el('span', { class: 'pill pill-accent', text: s.canonical })]),
+    el('td', { class: 'muted', text: s.note || '—' }),
+    el('td', { class: 'col-actions' }, [
+      el('button', { class: 'btn btn-sm btn-danger', type: 'button', text: '删除', onclick: () => removeSynonym(s) }),
+    ]),
+  ])));
+}
+
+export function addSynonymDialog() {
+  const nameIn = el('input', {
+    class: 'input', placeholder: '别名，例如 DeepSeek-V4-Flash-0731', autocomplete: 'off', list: 'modelNameHints2',
+  });
+  const canonIn = el('input', {
+    class: 'input', placeholder: '规范名，例如 deepseek-v4-flash', autocomplete: 'off', list: 'modelNameHints2',
+  });
+  const noteIn = el('input', { class: 'input', placeholder: '备注（可选）', autocomplete: 'off' });
+
+  const hints = [...new Set([
+    ...state.downstream.map((m) => m.id),
+    ...state.synonyms.map((s) => s.canonical),
+    ...state.upstreamGroups.flatMap((g) => g.models || []),
+  ])];
+  const datalist = el('datalist', { id: 'modelNameHints2' }, hints.map((h) => el('option', { value: h })));
+
+  openModal({
+    title: '新建模型归并',
+    bodyNode: [
+      datalist,
+      field('别名', nameIn, '要被折叠掉的名字（调用它也会被路由到规范名）'),
+      field('归并到（规范名）', canonIn, '下游保留展示的就是这个名字'),
+      field('备注', noteIn, '可选，给自己看的说明'),
+    ],
+    okText: '创建',
+    onOk: async () => {
+      if (!nameIn.value.trim()) { toast('别名必填', 'warn'); return false; }
+      if (!canonIn.value.trim()) { toast('规范名必填', 'warn'); return false; }
+      try {
+        await api.addSynonym({
+          name: nameIn.value.trim(),
+          canonical: canonIn.value.trim(),
+          note: noteIn.value.trim() || null,
+        });
+      } catch (e) { toast(e.message, 'err'); return false; }
+      toast('已创建归并', 'ok');
+      await loadAliases();
+    },
+  });
+}
+
+async function removeSynonym(s) {
+  const ok = await confirmDialog('删除归并', `确认删除「${s.name} → ${s.canonical}」？\n删除后「${s.name}」会重新作为一个独立模型名出现在清单里。`);
+  if (!ok) return;
+  try {
+    await api.deleteSynonym(s.name);
+    toast('已删除', 'ok');
+    await loadAliases();
+  } catch (e) { toast(e.message, 'err'); }
+}
+
 export function initAliasesView() {
   const btnAll = $('#btnFetchAllModels');
   if (btnAll) btnAll.addEventListener('click', fetchAll);
@@ -291,6 +379,8 @@ export function initAliasesView() {
   if (btnAdd) btnAdd.addEventListener('click', () => addAliasDialog());
   const btnClear = $('#btnClearCatalog');
   if (btnClear) btnClear.addEventListener('click', clearCatalog);
+  const btnSyn = $('#btnAddSynonym');
+  if (btnSyn) btnSyn.addEventListener('click', () => addSynonymDialog());
 }
 
-export default { loadAliases, initAliasesView, addAliasDialog };
+export default { loadAliases, initAliasesView, addAliasDialog, addSynonymDialog };

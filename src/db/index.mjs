@@ -7,6 +7,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import config, { ensureDirs } from '../config.mjs';
 import { DDL, BUILTIN_CHANNELS } from './schema.mjs';
+import { syncBuiltinBans } from './channel-ban.mjs';
+import { BUILTIN_BANS } from './builtin-bans.mjs';
 import { uuid } from '../util/crypto.mjs';
 import log from '../util/log.mjs';
 
@@ -23,7 +25,26 @@ export function getDb() {
   migrate();
   ensureIndexes();
   seedBuiltins();
+  seedBlacklist();
   return db;
+}
+
+/**
+ * 预置「已确定用不了」的模型黑名单（用户 2026-10-08 要求）。
+ * 幂等：已存在的行不动（用户可能手动改过理由或已解禁）。
+ *
+ * ⚠️ 放在 seedBuiltins 之后 —— 它按渠道名查 channel 表，渠道必须先存在。
+ * ⚠️ 静态 import 造成的循环依赖是安全的：这些模块只在**函数体内**使用
+ *    本模块的 all/one/run，模块求值期不会解引用。
+ */
+function seedBlacklist() {
+  try {
+    const n = syncBuiltinBans(BUILTIN_BANS);
+    if (n) log.info(`[db] 内置模型黑名单：预置 ${n} 条`);
+  } catch (e) {
+    // 黑名单只是增强，播种失败不该让服务起不来
+    log.warn(`[db] 内置模型黑名单播种失败（不影响运行）: ${e.message}`);
+  }
 }
 
 /** 逐条建索引，且**单条失败不影响启动** ——

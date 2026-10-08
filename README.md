@@ -17,6 +17,9 @@
 | 错误 | 上游错误壳归一化为 OpenAI 格式，保留 `trace_id` |
 | Key 管理 | `uuid` 为主键（调用方传入），双判重，AES-256-GCM 加密 |
 | 模型映射 | 对外名 → 上游真名，支持渠道专属 / 全局 |
+| ⭐ 模型归并 | 别名 → 规范名（`DeepSeek-V4-Flash-0731` 等归一），下游只记一个名字 |
+| ⭐ 模型黑名单 | 原始 (渠道 × 上游模型) 永久拉黑，带原因；从清单隐藏 + 不发请求 |
+| ⭐ 自动拉黑 | 「从未成功过 + 失败超阈值」的 (渠道,模型) 自动加入黑名单 |
 | 测活 | 整渠道（`GET /models`）/ 指定模型（最小 chat 请求） |
 | 存储 | SQLite（`node:sqlite`），WAL 模式 |
 | 依赖 | **零第三方依赖** —— 只用 Node 内置模块 |
@@ -49,10 +52,12 @@
 | `sensenova-u1.5-lite` | ✅ | — | **`/v1/images/generations`** |
 
 想给下游起短名（如 `gpt-4o-mini`）就用**模型映射**（可选），见下文。
+跨渠道的同名模型（如上面商汤/书生的 `deepseek-v4-flash-*`）可以用**模型归并**合成一个名字，见下文。
 
 > ⚠️ 清单**不等于** token plan 实际能用。实测 `kimi-k3`、`deepseek-v4-pro` 虽在商汤清单里，
 > 调用却返回 `is not supported by TokenPlan`。清单只作参考，真实可用性靠测活确认。
 > （不过路由会自动落到有该模型的另一个渠道 —— 若那边能用，请求照样成功。）
+> ⭐ 这类**已确定用不了**的模型现在会被**自动拉黑**（见「模型黑名单」），不再出现在清单里、也不再被尝试。
 
 ---
 
@@ -144,8 +149,64 @@ curl http://127.0.0.1:3210/v1/chat/completions \
 2. 该上游名若被**全局映射**改名 → 原名折叠，只留对外名
 3. 该上游名若被**渠道专属映射**改名 → 只折叠那个渠道，其他渠道原名仍在
 4. 映射到的上游名即使不在目录里也照样列出（可能故意指向目录外的模型）
+5. ⭐ 被**归并**的别名折叠掉，只留规范名（见下）
+6. ⭐ 被**黑名单**拉黑的 `(渠道 × 原始上游模型)` 从清单里彻底消失
 
 **调用解析优先级**：渠道专属映射 > 全局映射 > 同名直通（目录里有该模型的渠道会优先被尝试，避免白跑 404）。
+
+### ⭐ 模型归并（同一个模型，一个名字）
+
+不同渠道的**同一个模型**上游名常常不一样：
+
+```
+商汤  deepseek-v4-flash
+书生  deepseek-v4-flash-0731
+魔搭  deepseek-ai/DeepSeek-V4-Flash-0731
+LLM7  deepseek-v4-flash:0731
+```
+
+把它们**归并**到一个规范名（如 `deepseek-v4-flash`）后：
+下游只用记**一个名字**；调任一别名也会被重定向到规范名，命中**所有**渠道。
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `GET` | `/api/synonyms` | 列归并 |
+| `POST` | `/api/synonyms` | 建：`{name, canonical, note?}` |
+| `DELETE` | `/api/synonyms/:name` | 删 |
+
+> 仅大小写不同（`Deepseek-V4-Flash` → `deepseek-v4-flash`）也是合法归并。
+> 控制台「模型」页可直接操作。
+
+### ⭐ 模型黑名单（原始渠道 × 原始上游模型）
+
+**「连续失败过多 / 从来没成功过」+「已知确定用不了」的模型会被拉黑**：
+从下游模型清单里**隐藏**，转发时**一次请求都不发**；每条都带**可读理由**，可在控制台查看与解禁。
+
+⚠️ 键是 **原始渠道名 + 原始上游模型名**（不是对外名、不是转换后的名字）。
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `GET` | `/api/blacklist?channel=&source=` | 列黑名单（含原因 / 来源 / 失败成功计数） |
+| `POST` | `/api/blacklist` | 手动加入 `{channel, model, reason}` |
+| `POST` | `/api/blacklist/unban` | 解禁 `{channel, model}` |
+| `POST` | `/api/blacklist/sync-fast` | 按「只接快速模型」开关重算 fast-mode 拉黑 |
+
+**来源**（`source`）：
+
+| 值 | 含义 |
+|---|---|
+| `builtin` | 内置「已确定用不了」名单（来自逐模型实测，见 `tools/scan-result-2026-10-07.md`） |
+| `fast-mode` | 快速模式未收录（目录虚胖渠道，只保留实测可用的快速模型） |
+| `auto` | 连续失败自动加入（**从未成功过** 且失败 ≥ `MODEL_AUTO_BAN_AFTER_FAILS`） |
+| `manual` | 人工加入 |
+
+### ⭐ 运行开关（`GET/PATCH /api/settings`）
+
+| 字段 | 默认 | 说明 |
+|---|:---:|---|
+| `fastModelsOnly` | **开** | 只接快速模型（目录虚胖渠道如 NVIDIA）；开关变化会**同步 fast-mode 拉黑** |
+| `blacklistEnabled` | **开** | 模型黑名单总开关；关闭后**只记录、不拦截** |
+| `autoBlacklistEnabled` | **开** | 是否自动把「从未成功过 + 失败超阈值」的 (渠道,模型) 拉黑 |
 
 ### 渠道 / 观测 / Token
 
@@ -323,6 +384,9 @@ google/gemma-4-31b-it:free             →  gemma-4-31b-it        和  Gemma-4-3
 | `DISABLE_AFTER_FAILS` | `10` | 连续失败多少次后禁用 Key |
 | `DISABLED_RECOVER_MS` | `86400000` | 被禁用后多久自动恢复（24 小时） |
 | `DOWNSTREAM_RETRY_AFTER_MS` | `20000` | 全渠道耗尽时给客户端的重试建议（**≠** 内部冷却） |
+| ⭐ `BLACKLIST_ENABLED` | `1` | 模型黑名单总开关（`0` = 只记录不拦截）；可在控制台切换 |
+| ⭐ `AUTO_BLACKLIST` | `1` | 是否自动把「从未成功过 + 失败超阈值」的 (渠道,模型) 拉黑 |
+| ⭐ `MODEL_AUTO_BAN_AFTER_FAILS` | `10` | 自动拉黑阈值：从未成功过且累计失败达此数 → 拉黑 |
 | `LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
 
 > `DOWNSTREAM_RETRY_AFTER_MS` 默认 20 秒而非内部冷却的 10 分钟：它只是"建议客户端何时再来"，
@@ -339,7 +403,7 @@ api2api/
 │   ├── config.mjs            # 配置加载
 │   ├── relay.mjs             # ⭐ 转发核心（首个成功即返回）
 │   ├── util/                 # 日志 / 错误分类 / 加密
-│   ├── db/                   # schema / 渠道 / Key / 映射 / 状态 / 流水 / token
+│   ├── db/                   # schema / 渠道 / Key / 映射 / 归并 / 黑名单 / 状态 / 流水 / token
 │   ├── adapters/             # ⭐ 适配器：sensenova / intern / 通用 + 测活探针
 │   ├── scheduler/            # ⭐ 调度：优先级桶 / 填满优先 / RPM 限速 / 线性冷却
 │   └── http/                 # /v1 对外 + /api 管理 + 静态文件
@@ -366,13 +430,13 @@ bash deploy/api2api-ctl.sh restart    # 重启
 ## 测试
 
 ```bash
-node --no-warnings test/smoke.test.mjs     # 73 项单元/集成
-node --no-warnings test/e2e.test.mjs       # 45 项端到端（含 mock 上游）
-node --no-warnings test/migrate.test.mjs   # 8 项老库迁移回归
+node --no-warnings test/smoke.test.mjs     # 178 项单元/集成
+node --no-warnings test/e2e.test.mjs       # 54 项端到端（含 mock 上游）
+node --no-warnings test/migrate.test.mjs   # 18 项老库迁移回归
 node --no-warnings test/_loadcheck.mjs     # 模块加载自检
 ```
 
-**本地与 219 上均为 126/126 全绿。**
+**本地与 219 上均为 250/250 全绿。**
 
 > `migrate.test.mjs` 存在的理由：新 schema 曾在 DDL 里给老库尚不存在的列建索引，
 > 导致 `no such column: disabled_until` → 进程退出 → systemd 无限重启。

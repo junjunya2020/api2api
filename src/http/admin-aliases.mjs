@@ -9,6 +9,8 @@
  *   GET    /api/models/upstream    上游目录明细（按渠道分组 + 拉取时间）
  *   POST   /api/models/fetch       拉上游真实模型清单，**并落库** → 下游立即可见
  *   DELETE /api/models/upstream    清空目录（channel=xxx / all=true）
+ *
+ * 注：模型黑名单 / 归并 在 `admin-blacklist.mjs`。
  */
 import * as aliases from '../db/aliases.mjs';
 import * as catalog from '../db/catalog.mjs';
@@ -17,7 +19,8 @@ import { listKeys, getKeySecret } from '../db/keys.mjs';
 import { getAdapter } from '../adapters/index.mjs';
 import { ErrClass } from '../util/errors.mjs';
 import { fastModelsOnly } from '../db/settings.mjs';
-import { isFastOnlyChannel, filterFastModels, fastModelsOf } from '../db/fast-models.mjs';
+import { isFastOnlyChannel, isFastModel, fastModelsOf } from '../db/fast-models.mjs';
+import * as blacklist from '../db/channel-ban.mjs';
 import { readJson, sendJson, matchPath, HttpError } from './util.mjs';
 import config from '../config.mjs';
 import log from '../util/log.mjs';
@@ -149,12 +152,26 @@ export async function handleAliases(req, res, url) {
       // ⭐「只接快速模型」——对目录严重虚胖的渠道（NVIDIA：80 个里真能用个位数），
       //   默认只收录**实测可用且快**的那几个。开关默认打开，可在设置页关闭。
       let fastFiltered = false;
-      if (fastModelsOnly() && isFastOnlyChannel(ch.name)) {
+      let fastBans = null;
+      const isFastCh = fastModelsOnly() && isFastOnlyChannel(ch.name);
+      if (isFastCh) {
         const before = ids.length;
-        ids = filterFastModels(ch.name, ids);
+        const allowed = ids.filter((id) => isFastModel(ch.name, id));
+        const dropped = ids.filter((id) => !isFastModel(ch.name, id));
+        ids = allowed;
         fastFiltered = before !== ids.length;
         log.info(`[models/fetch] ${ch.name} 只接快速模型：${before} → ${ids.length}`
           + `（白名单 ${fastModelsOf(ch.name).length} 个）`);
+        // ⭐ 被挡掉的模型**也**进黑名单（用户要求「nvidia 那些模型开启了快速
+        //   模式后就默认拉黑」）。否则它们只会"不在目录里"而**不在黑名单里**，
+        //   用户看不到"为什么没有它"。落库为 fast-mode 来源，可在设置页解禁。
+        fastBans = blacklist.banMany({
+          channel: ch.name,
+          models: dropped,
+          reason: '快速模式未收录：该渠道目录虚胖（多数模型 404/410 或挂死），'
+            + '只保留实测可用的快速模型。可在设置页关闭「只接快速模型」或手动解禁。',
+          source: blacklist.BanSource.FAST_MODE,
+        });
       }
 
       // 落库：上游有什么，下游就能看到什么
@@ -171,6 +188,7 @@ export async function handleAliases(req, res, url) {
       return sendJson(res, 200, {
         ok: true, channel: ch.name, channelDisplay: ch.display_name,
         count: ids.length, saved, upstreamTotal, freeFiltered, fastFiltered,
+        fastBanned: fastBans?.added ?? 0,
         autoAliases: auto.created,
         models: ids,
         downstreamTotal: aliases.publicModelList().length,

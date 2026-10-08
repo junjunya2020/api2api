@@ -129,6 +129,30 @@
         <div class="empty" id="aliasEmpty" hidden>没有额外映射 —— 这是正常状态，上游模型原名已可直接调用。</div>
       </div>
 
+      <!-- ⭐ 模型归并（用户 2026-10-08）：同一个模型的多个名字合成一个 -->
+      <div class="panel">
+        <div class="panel-head">
+          <h3>模型归并（同一个模型，一个名字）</h3>
+          <div class="panel-actions">
+            <button id="btnAddSynonym" class="btn" type="button">+ 新建归并</button>
+          </div>
+        </div>
+        <p class="muted" style="font-size:12px;margin:0 0 10px">
+          不同渠道的同一个模型名字常不一样（例：<code>DeepSeek-V4-Flash-0731</code> /
+          <code>deepseek-v4-flash-0731</code> / <code>deepseek-v4-flash:0731</code>）。
+          归并后下游只用规范名 <code>deepseek-v4-flash</code> 一个名字，别名自动折叠、不再重复出现。
+        </p>
+        <div class="table-wrap">
+          <table class="table">
+            <thead>
+              <tr><th>别名（自动折叠）</th><th>归并到（规范名）</th><th>备注</th><th class="col-actions">操作</th></tr>
+            </thead>
+            <tbody id="synonymTbody"></tbody>
+          </table>
+        </div>
+        <div class="empty" id="synonymEmpty" hidden>还没有归并 —— 多渠道的同名模型会各自显示一个名字。</div>
+      </div>
+
       <div class="panel" id="upstreamPanel" hidden>
         <div class="panel-head"><h3 id="upstreamTitle">上游模型清单</h3></div>
         <div class="chips" id="upstreamChips"></div>
@@ -281,6 +305,15 @@
         <div class="empty" id="rateEmpty" hidden>还没有请求流水。</div>
       </div>
 
+      <!-- ⭐ 模型黑名单（只读概览；增删请在「设置」页） -->
+      <div class="panel">
+        <div class="panel-head">
+          <h3>模型黑名单</h3>
+          <span class="muted" style="font-size:12px">原始渠道名 + 原始上游模型名 · 增删请到「设置」页</span>
+        </div>
+        <div class="panel-body" id="banStatBody"></div>
+      </div>
+
       <div class="panel">
         <div class="panel-head"><h3>渠道维度</h3></div>
         <div class="table-wrap">
@@ -368,6 +401,15 @@
       <div class="panel">
         <div class="panel-head"><h3>调度设置</h3></div>
         <div class="panel-body" id="settingsBody"></div>
+      </div>
+
+      <!-- ⭐ 模型黑名单（用户 2026-10-08）：原始渠道名 + 原始上游模型名 -->
+      <div class="panel">
+        <div class="panel-head">
+          <h3>模型黑名单设置</h3>
+          <span class="muted" style="font-size:12px">被拉黑的不再出现在模型清单里，也不再被尝试</span>
+        </div>
+        <div class="panel-body" id="blacklistBody"></div>
       </div>
     </section>
 

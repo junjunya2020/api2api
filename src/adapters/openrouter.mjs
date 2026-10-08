@@ -47,6 +47,12 @@ const STR_HINTS = [
   { re: /no (cookie )?auth|user not found|invalid.*(api ?key|token)|unauthor/i, errClass: ErrClass.AUTH },
   { re: /permission|forbidden/i, errClass: ErrClass.AUTH },
   { re: /model.*not.*(found|exist)|no allowed providers|no endpoints found/i, errClass: ErrClass.CONFIG_FAULT },
+  // ⚠️ 「不是合法的 model ID」= 这个模型在 OpenRouter 不存在 → 必须归 CONFIG_FAULT
+  //    （跳过本渠道、继续下一个）。曾归 REQUEST_FAULT（不换渠道、直接返回），
+  //    导致一个只在别的渠道有的模型**在 OpenRouter 就被掐断**，压根走不到能用的那家。
+  //    实测 2026-10-08：`nvidia/riva-translate-4b-instruct` 走到 openrouter 时被
+  //    400「is not a valid model ID」拦下 → 整条请求 400（商汤/书生都是 404 可继续）。
+  { re: /not a valid model id|valid model id|unknown model|model.*(does not exist|invalid)/i, errClass: ErrClass.CONFIG_FAULT },
   { re: /context.*(length|token)|max.*token|too long|invalid.*(request|parameter)/i, errClass: ErrClass.REQUEST_FAULT },
 ];
 
@@ -152,6 +158,19 @@ export class OpenRouterAdapter extends BaseAdapter {
     const num = typeof rawCode === 'number'
       ? rawCode
       : (typeof rawCode === 'string' && /^\d+$/.test(rawCode) ? +rawCode : null);
+
+    // ⚠️ 400 是最泛的壳，**先看消息文本**再决定归类：
+    //    `{"error":{"code":400,"message":"xxx is not a valid model ID"}}`
+    //    这类"模型不存在"必须归 CONFIG_FAULT（跳过本渠道继续下一个），
+    //    而纯参数错才是 REQUEST_FAULT（不换渠道）。只看数字会把两者混为一谈。
+    if (num === 400 && message) {
+      for (const h of STR_HINTS) {
+        if (h.re.test(String(message))) {
+          return { errClass: h.errClass, message, code: rawCode, traceId };
+        }
+      }
+    }
+
     if (num != null && NUM_CODE_MAP[num]) {
       const m = NUM_CODE_MAP[num];
       return { errClass: m.errClass, message: message || `HTTP ${num}`, code: rawCode, traceId };

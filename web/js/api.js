@@ -87,6 +87,23 @@ export const api = {
   states: (channel) => request('GET', `/api/stats/states${channel ? `?channel=${encodeURIComponent(channel)}` : ''}`),
   logs: (limit) => request('GET', `/api/logs?limit=${limit || 100}`),
 
+  // ⭐ 模型黑名单（原始渠道名 + 原始上游模型名）
+  blacklist: ({ channel, source } = {}) => {
+    const q = new URLSearchParams();
+    if (channel) q.set('channel', channel);
+    if (source) q.set('source', source);
+    const s = q.toString();
+    return request('GET', `/api/blacklist${s ? `?${s}` : ''}`);
+  },
+  banModel: (payload) => request('POST', '/api/blacklist', payload),
+  unbanModel: (channel, model) => request('POST', '/api/blacklist/unban', { channel, model }),
+  syncFastBans: () => request('POST', '/api/blacklist/sync-fast', {}),
+
+  // ⭐ 模型归并（别名 → 规范名）
+  synonyms: () => request('GET', '/api/synonyms'),
+  addSynonym: (payload) => request('POST', '/api/synonyms', payload),
+  deleteSynonym: (name) => request('DELETE', `/api/synonyms/${encodeURIComponent(name)}`),
+
   // ⭐ 模型健康度（正常 / 降级 / 不可用）
   modelHealth: ({ channel, state } = {}) => {
     const q = new URLSearchParams();

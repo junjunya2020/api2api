@@ -22,8 +22,9 @@ import {
 import * as rate from './scheduler/rate.mjs';
 import { ErrClass, ApiError, classifyByStatus } from './util/errors.mjs';
 import { logRequest } from './db/logs.mjs';
-import { fastModelsOnly } from './db/settings.mjs';
+import { fastModelsOnly, blacklistEnabled } from './db/settings.mjs';
 import { isFastOnlyChannel, isFastModel } from './db/fast-models.mjs';
+import { bannedPairSet } from './db/channel-ban.mjs';
 import config from './config.mjs';
 import log from './util/log.mjs';
 
@@ -92,6 +93,36 @@ export async function relay({ publicModel, rawBody, pathTail = 'chat/completions
   }
   const candidates0 = withKeys.length ? withKeys : sorted;
 
+  // ⭐ 模型黑名单（用户 2026-10-08）—— **在一切之前**直接剔除。
+  //
+  //   语义：黑名单是**永久**的（只能手动解禁），且**一次请求都不发**。
+  //   键 = (渠道 id × 原始上游模型名) —— 用户明确要求"原始渠道+原始上游模型"。
+  //
+  //   ⚠️ 为什么必须放在最前面：如果放在"目录确认没有→回退全试"之前，
+  //      被拉黑的渠道会因为 filtered 非空而让兜底失效；而且黑名单里的模型
+  //      本来就是 404/挂死，让它参与任何一层判定都是纯浪费。
+  //
+  //   ⚠️ 总开关关闭时**不拦截**（黑名单只保留记录）。
+  const banned = blacklistEnabled() ? bannedPairSet() : new Set();
+  const preBan = candidates0.filter((c) => !banned.has(`${c.channelId}::${c.upstreamName}`));
+  const bannedPairs = candidates0.length - preBan.length;
+  if (bannedPairs > 0) {
+    log.debug(`[relay] 按模型黑名单剔除 ${bannedPairs} 个 (渠道,模型) 候选`);
+    // 全部候选都被拉黑 → 明确拒绝（不是"没有渠道"，是"已知不可用"）。
+    // 必须在"快速白名单"判定**之前**，理由更权威（永久 vs 开关）。
+    if (!preBan.length) {
+      logRequest({
+        model: null, publicModel, channelId: null, keyUuid: null,
+        status: 404, errClass: ErrClass.CONFIG_FAULT, upstreamTrace: null,
+        latencyMs: null, attempts: 0, chain: null,
+      });
+      throw new ApiError(404, `模型 "${publicModel}" 在该渠道已被拉黑（可在设置页「模型黑名单」解禁）`, {
+        code: 'model_blacklisted', type: 'invalid_request_error',
+        errClass: ErrClass.CONFIG_FAULT, logged: true,
+      });
+    }
+  }
+
   // ⭐「只接快速模型」运行时闸门（用户 2026-10-07）—— **必须先于目录"确定没有"判定**。
   //   拉目录时已过滤，这里再兜一层：若目录还是老的（残留慢模型），也**不能把请求
   //   打到"永不返回"的模型上**（NVIDIA 目录 80 个里多数是挂死的）。
@@ -99,13 +130,13 @@ export async function relay({ publicModel, rawBody, pathTail = 'chat/completions
   //
   //   ⚠️ 顺序很重要：如果放在下面那步**之后**，会把"目录全确认没有 → 回退全试"
   //      的兜底挡掉，导致本该真打一次上游的请求被凭空 404。
-  let pre = candidates0;
+  let pre = preBan;
   if (fastModelsOnly()) {
-    pre = candidates0.filter(
+    pre = preBan.filter(
       (c) => !(isFastOnlyChannel(c.channelName) && !isFastModel(c.channelName, c.upstreamName)),
     );
     // 全部候选都被"快速白名单"挡掉 → 明确拒绝，而不是退回去打挂死模型
-    if (!pre.length && candidates0.length) {
+    if (!pre.length && preBan.length) {
       logRequest({
         model: null, publicModel, channelId: null, keyUuid: null,
         status: 404, errClass: ErrClass.CONFIG_FAULT, upstreamTrace: null,

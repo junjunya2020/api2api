@@ -208,6 +208,34 @@ export const config = {
    */
   fastModels: pick('FAST_MODELS', ''),
 
+  /**
+   * ⭐ 模型黑名单**总开关**（用户 2026-10-08 要求，**默认打开**）。
+   *
+   * 语义：黑名单里的 (渠道 × 原始上游模型) ①从下游模型清单里隐藏
+   * ②relay 直接不发请求。关闭后黑名单只保留记录、不产生任何拦截效果。
+   *
+   * 运行时可在控制台切换（落 meta 表），优先级 **DB > env > 本默认值**。
+   */
+  blacklistEnabled: int('BLACKLIST_ENABLED', 1),
+
+  /**
+   * ⭐ 是否**自动**把连续失败且从未成功过的 (渠道, 模型) 加入黑名单
+   * （用户 2026-10-08：「连续失败过多的模型+渠道自动禁用」）。默认打开。
+   */
+  autoBlacklistEnabled: int('AUTO_BLACKLIST', 1),
+
+  /**
+   * 自动拉黑的阈值：**从未成功过**（total_ok == 0）且累计失败达到这个次数
+   * → 自动加入黑名单。
+   *
+   * 为什么要求 total_ok == 0：用户原话是
+   *   「比如一个模型 从来没成功过 每次调用都失败」——
+   *   一个偶尔能出字的模型哪怕失败率很高，也不该被"永久"拉黑（它还在提供服务）。
+   *   失败率高的交给 model_health 的三级熔断（可自动恢复），
+   *   这里只处理"压根没救"的。
+   */
+  modelAutoBanAfterFails: int('MODEL_AUTO_BAN_AFTER_FAILS', 10),
+
   /** 请求体大小上限 */
   maxBodyBytes: int('MAX_BODY_BYTES', 8 * 1024 * 1024),
 
