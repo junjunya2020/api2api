@@ -15,14 +15,8 @@
 import * as aliases from '../db/aliases.mjs';
 import * as catalog from '../db/catalog.mjs';
 import { getChannel, listChannels } from '../db/channels.mjs';
-import { listKeys, getKeySecret } from '../db/keys.mjs';
-import { getAdapter } from '../adapters/index.mjs';
-import { ErrClass } from '../util/errors.mjs';
-import { fastModelsOnly } from '../db/settings.mjs';
-import { isFastOnlyChannel, isFastModel, fastModelsOf } from '../db/fast-models.mjs';
-import * as blacklist from '../db/channel-ban.mjs';
+import { fetchChannelModels } from './models-fetch.mjs';
 import { readJson, sendJson, matchPath, HttpError } from './util.mjs';
-import config from '../config.mjs';
 import log from '../util/log.mjs';
 
 function shape(a) {
@@ -114,88 +108,25 @@ export async function handleAliases(req, res, url) {
   }
 
   // 去上游拉真实模型清单，**并落库**
+  //
+  // 实现抽到 `models-fetch.mjs`（`fetchChannelModels`）—— 因为「只接快速模型」
+  // 开关变更时也要走同一条路径（见 admin-meta 的 PATCH /api/settings），
+  // 两处各写一份必然漂移，而漂移的后果是"被快速白名单挡下的模型漏进黑名单"。
   if (pathname === '/api/models/fetch' && method === 'POST') {
     const body = await readJson(req);
     const chRef = body?.channel;
     if (!chRef) throw new HttpError(400, '需要 channel 参数');
     const ch = getChannel(chRef);
     if (!ch) throw new HttpError(404, `渠道不存在: ${chRef}`);
-
-    const k = listKeys({ channel: ch.id, enabledOnly: true })[0];
-    if (!k) throw new HttpError(400, `渠道 ${ch.name} 下没有启用的 Key，无法拉取`);
-
-    const adapter = getAdapter(ch.adapter);
-    const secret = getKeySecret(k.uuid);
     try {
-      const res2 = await fetch(adapter.modelsUrl(ch.base_url), {
-        method: 'GET',
-        headers: adapter.headers(secret),
-        signal: AbortSignal.timeout(config.upstreamConnectTimeoutMs),
-      });
-      const text = await res2.text();
-      const verdict = adapter.classify(res2.status, res2.headers, text);
-      if (verdict.errClass !== ErrClass.OK) {
-        return sendJson(res, 502, {
-          ok: false, httpStatus: res2.status,
-          error: verdict.message || `上游返回 ${res2.status}`,
-        });
-      }
-      let json = null;
-      try { json = JSON.parse(text); } catch { /* ignore */ }
-
-      // 混合渠道（如 OpenRouter：465 个里只有 16 个免费）默认只收免费模型。
-      // 付费模型放进目录会让下游清单被淹没，且误调用会真实扣费。
-      const upstreamTotal = Array.isArray(json?.data) ? json.data.length : 0;
-      let ids = adapter.parseModels(json);
-      const freeFiltered = upstreamTotal > ids.length;
-
-      // ⭐「只接快速模型」——对目录严重虚胖的渠道（NVIDIA：80 个里真能用个位数），
-      //   默认只收录**实测可用且快**的那几个。开关默认打开，可在设置页关闭。
-      let fastFiltered = false;
-      let fastBans = null;
-      const isFastCh = fastModelsOnly() && isFastOnlyChannel(ch.name);
-      if (isFastCh) {
-        const before = ids.length;
-        const allowed = ids.filter((id) => isFastModel(ch.name, id));
-        const dropped = ids.filter((id) => !isFastModel(ch.name, id));
-        ids = allowed;
-        fastFiltered = before !== ids.length;
-        log.info(`[models/fetch] ${ch.name} 只接快速模型：${before} → ${ids.length}`
-          + `（白名单 ${fastModelsOf(ch.name).length} 个）`);
-        // ⭐ 被挡掉的模型**也**进黑名单（用户要求「nvidia 那些模型开启了快速
-        //   模式后就默认拉黑」）。否则它们只会"不在目录里"而**不在黑名单里**，
-        //   用户看不到"为什么没有它"。落库为 fast-mode 来源，可在设置页解禁。
-        fastBans = blacklist.banMany({
-          channel: ch.name,
-          models: dropped,
-          reason: '快速模式未收录：该渠道目录虚胖（多数模型 404/410 或挂死），'
-            + '只保留实测可用的快速模型。可在设置页关闭「只接快速模型」或手动解禁。',
-          source: blacklist.BanSource.FAST_MODE,
-        });
-      }
-
-      // 落库：上游有什么，下游就能看到什么
-      const saved = catalog.replaceChannelModels(ch.id, ids);
-
-      // 自动生成友好别名：`deepseek.ai/deepseek-v4.1-flash:free`
-      //   → `deepseek-v4.1-flash` / `Deepseek-V4.1-Flash`（都挂在本渠道）
-      // 原名照样能用（同名直通），友好名只是额外入口。
-      const auto = catalog.seedFriendlyAliases(ch.id, ids);
-
-      log.info(`[models/fetch] ${ch.name} 上游 ${upstreamTotal} 个 → 收录 ${ids.length} 个，`
-        + `自动生成 ${auto.created} 条友好别名`);
-
-      return sendJson(res, 200, {
-        ok: true, channel: ch.name, channelDisplay: ch.display_name,
-        count: ids.length, saved, upstreamTotal, freeFiltered, fastFiltered,
-        fastBanned: fastBans?.added ?? 0,
-        autoAliases: auto.created,
-        models: ids,
-        downstreamTotal: aliases.publicModelList().length,
-      });
+      const out = await fetchChannelModels(chRef);
+      return sendJson(res, 200, { ...out, downstreamTotal: aliases.publicModelList().length });
     } catch (e) {
       log.warn(`[models/fetch] ${ch.name} 失败: ${e.message}`);
-      return sendJson(res, 502, { ok: false, error: `拉取失败: ${e.message}` });
+      return sendJson(res, e.status === 400 ? 400 : 502, {
+        ok: false, httpStatus: e.httpStatus ?? null,
+        error: e.status === 400 ? e.message : `拉取失败: ${e.message}`,
+      });
     }
   }
 

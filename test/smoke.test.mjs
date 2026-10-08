@@ -1828,6 +1828,19 @@ t('★ 快速模式：NVIDIA 未收录模型默认拉黑；关掉开关则移除
   assert.ok(!ban.isBanned('nvidia', 'definitely-not-fast-model'));
 });
 
+t('★ 开关"关→开"后 applyFastModeBans(true) 能恢复（目录里还在的那些）', () => {
+  // ⚠️ 这条锁的是"扫描能覆盖目录残留"这个语义。
+  //    真正的坑（拉目录时被挡下、压根不入库的那批）只能靠**重拉目录**恢复 ——
+  //    见 admin-meta 的 PATCH /api/settings（开→重拉快速渠道）+ 下面那条 fetch 用例。
+  const nv = channels.getChannel('nvidia');
+  catalog.replaceChannelModels(nv.id, ['definitely-not-fast-model']);
+  ban.applyFastModeBans(false);
+  assert.ok(!ban.isBanned('nvidia', 'definitely-not-fast-model'));
+  const r = ban.applyFastModeBans(true);
+  assert.strictEqual(r.added, 1, '目录里还留着的应能被重新扫到');
+  assert.ok(ban.isBanned('nvidia', 'definitely-not-fast-model'));
+});
+
 t('黑名单不影响内置来源：重算 fast-mode 不动 builtin', () => {
   ban.applyFastModeBans(true);
   ban.applyFastModeBans(false);

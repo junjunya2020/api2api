@@ -19,6 +19,7 @@ import * as logs from '../db/logs.mjs';
 import * as state from '../db/state.mjs';
 import * as settings from '../db/settings.mjs';
 import * as blacklist from '../db/channel-ban.mjs';
+import { refetchFastChannels } from './models-fetch.mjs';
 import { keyStats } from '../db/keys.mjs';
 import { publicModelList } from '../db/aliases.mjs';
 import { adapterIds } from '../adapters/index.mjs';
@@ -55,18 +56,22 @@ export async function handleMeta(req, res, url) {
     const changed = [];
 
     if (body && body.fastModelsOnly !== undefined) {
-      out.fastModelsOnly = settings.setFastModelsOnly(!!body.fastModelsOnly);
+      const next = settings.setFastModelsOnly(!!body.fastModelsOnly);
+      out.fastModelsOnly = next;
       changed.push('fastModelsOnly');
+
       // ⭐ 快速模式开关变更 → 同步 fast-mode 拉黑（NVIDIA 未收录模型）。
-      //    开 → 未收录的拉黑；关 → 移除 fast-mode 拉黑。用户要求「nvidia 那些模型
-      //    开启了快速模式后就默认拉黑」。
+      //    用户要求「nvidia 那些模型开启了快速模式后就默认拉黑」。
       //
-      //    ⚠️ 这里扫的是**当前目录**，所以只能覆盖"目录里还在、但不在白名单里"的
-      //       残留。新拉目录时被白名单挡掉的模型**根本不会入库** ——
-      //       那部分由 `/api/models/fetch` 在过滤的当下直接 `banMany` 落黑名单。
-      //       两处配合才能做到「快速模式收录之外的都拉黑」。
+      //    ⚠️ 关键：拉目录时被白名单挡下的模型**根本不进 `upstream_model` 表**，
+      //       所以"扫目录"只能覆盖残留的那部分。**关掉开关再打开**时，
+      //       之前 `fetch` 落库的那批已经不在目录里、扫不回来 ——
+      //       必须**重拉一次该渠道的目录**，`fetch` 的过滤分支才会重新把它们拉黑。
+      //       （不重拉的话开关会"看起来生效了"，实际黑名单是空的。）
       try {
-        out.fastModeSync = blacklist.applyFastModeBans(out.fastModelsOnly);
+        out.fastModeSync = next
+          ? await refetchFastChannels()
+          : blacklist.applyFastModeBans(false);
       } catch (e) {
         out.fastModeSync = { error: e.message };
       }
