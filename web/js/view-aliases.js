@@ -8,7 +8,7 @@
  */
 import api from './api.js';
 import {
-  $, el, fmtAgo, toast, openModal, field, confirmDialog,
+  $, el, fmtAgo, toast, openModal, closeModal, field, confirmDialog,
 } from './ui.js';
 import { getChannels } from './view-keys.js';
 
@@ -58,16 +58,112 @@ function render() {
       ? (m.channels || []).map((c) => el('span', { class: 'pill pill-idle', text: c, style: 'margin-right:4px' }))
       : [el('span', { class: 'muted', text: '—' })]),
     el('td', { class: 'col-actions' }, [
-      el('button', {
-        class: 'btn btn-sm', type: 'button', text: '复制',
-        onclick: () => {
-          navigator.clipboard?.writeText(m.id)
-            .then(() => toast(`已复制 ${m.id}`, 'ok'))
-            .catch(() => toast('复制失败', 'err'));
-        },
-      }),
+      el('button', { class: 'btn btn-sm', type: 'button', text: '复制',
+        onclick: () => navigator.clipboard?.writeText(m.id).then(() => toast(`已复制 ${m.id}`, 'ok')).catch(() => toast('复制失败', 'err')) }),
+      document.createTextNode(' '),
+      el('button', { class: 'btn btn-sm', type: 'button', text: '拉黑模型', onclick: () => banModelDialog(m) }),
+      document.createTextNode(' '),
+      el('button', { class: 'btn btn-sm', type: 'button', text: '测试可用性', onclick: () => testAvailabilityDialog(m) }),
+      document.createTextNode(' '),
+      el('button', { class: 'btn btn-sm', type: 'button', text: '测试指纹', onclick: () => testFingerprintDialog(m) }),
     ]),
   ])));
+}
+
+/* ---------------- 行操作：拉黑 / 测可用性 / 测指纹 ---------------- */
+
+/** 该模型可用的 (原始渠道, 原始上游模型名) 目标 */
+function targetsOf(m) {
+  return (m.targets || []).filter((t) => t && t.channel && t.upstream);
+}
+
+function pickTargetDialog(title, m, intro, onPick) {
+  const targets = targetsOf(m);
+  if (!targets.length) { toast('这个模型没有可用的渠道目标（可能全被拉黑了）', 'warn'); return; }
+
+  const list = el('div', { style: 'display:flex;flex-direction:column;gap:6px' });
+  const nodes = targets.map((t) => el('button', {
+    class: 'btn', type: 'button',
+    style: 'justify-content:flex-start;text-align:left',
+    text: `${t.channel}  ×  ${t.upstream}`,
+    onclick: () => { closeModal(true); onPick(t); },
+  }));
+  list.replaceChildren(...nodes);
+
+  openModal({ title, bodyNode: [el('p', { class: 'muted', style: 'font-size:12.5px', text: intro }), list], okText: '取消', cancelText: '关闭' });
+}
+
+function banModelDialog(m) {
+  if (!targetsOf(m).length) { toast('没有可拉黑的渠道目标', 'warn'); return; }
+  pickTargetDialog('拉黑模型（选择渠道）', m,
+    '拉黑的是「原始渠道名 + 原始上游模型名」。该组合将不再出现在下游模型清单、也不再被尝试。', (t) => {
+      const reasonIn = el('input', { class: 'input', placeholder: '为什么拉黑（用户可见）', value: '手动拉黑（从模型页）' });
+      openModal({
+        title: `拉黑 ${t.channel} / ${t.upstream}`,
+        bodyNode: [field('原因', reasonIn, '会展示给用户，说明为什么拉黑')],
+        okText: '加入黑名单',
+        onOk: async () => {
+          await api.banModel({ channel: t.channel, model: t.upstream, reason: reasonIn.value.trim() || '手动拉黑' });
+          toast('已加入黑名单', 'ok');
+          await loadAliases();
+        },
+      });
+    });
+}
+
+function testAvailabilityDialog(m) {
+  if (!targetsOf(m).length) { toast('没有可测试的渠道目标', 'warn'); return; }
+  pickTargetDialog('测试可用性（选择渠道）', m,
+    '会把这个 (渠道, 模型) 在该渠道的**所有 Key** 上各打一次（每个 Key 默认 10 秒超时）。'
+    + '全部失败会自动拉黑；可在「后台任务管理」看进度。', (t) => {
+      const toIn = el('input', { class: 'input', type: 'number', value: '10', min: '3' });
+      const bgIn = el('input', { class: 'input', type: 'checkbox' });
+      const bgWrap = el('label', { style: 'display:flex;align-items:center;gap:8px;font-size:13px' }, [
+        bgIn, el('span', { text: '放到后台跑（推荐，可在「后台任务管理」看进度）' }),
+      ]);
+      openModal({
+        title: `测试可用性：${t.channel} / ${t.upstream}`,
+        bodyNode: [field('每个 Key 超时（秒）', toIn, '默认 10 秒'), bgWrap],
+        okText: '开始',
+        onOk: async () => {
+          const timeoutSec = Math.max(3, Number(toIn.value) || 10);
+          if (bgIn.checked) {
+            await api.enqueueProbe({ channel: t.channel, model: t.upstream, timeoutMs: timeoutSec * 1000 });
+            toast('已提交后台任务（可在「后台任务管理」查看）', 'ok', 5000);
+          } else {
+            toast('正在测试，请稍候…', 'info', 2500);
+            const r = await api.probeModel({ channel: t.channel, model: t.upstream, timeoutMs: timeoutSec * 1000 });
+            toast(r.allFailed ? `全部 ${r.total} 个 Key 失败${r.banned ? '，已自动拉黑' : ''}` : `${r.okCount}/${r.total} 个 Key 成功`, r.allFailed ? 'warn' : 'ok', 6000);
+            await loadAliases();
+          }
+        },
+      });
+    });
+}
+
+function testFingerprintDialog(m) {
+  const in_ = el('input', { class: 'input', value: m.id, autocomplete: 'off' });
+  const apiSel = el('select', { class: 'input' }, [
+    el('option', { value: 'cc', text: 'Chat Completions' }),
+    el('option', { value: 'responses', text: 'Responses' }),
+    el('option', { value: 'message', text: 'Anthropic Messages' }),
+  ]);
+  openModal({
+    title: '测试模型指纹',
+    bodyNode: [
+      field('模型名（网关对外名即可）', in_, '会用 lm-detector 让模型写随机数，识别背后真实模型'),
+      field('协议', apiSel, '多数渠道用 Chat Completions'),
+    ],
+    okText: '后台测试',
+    onOk: async () => {
+      const model = in_.value.trim();
+      if (!model) { toast('模型名必填', 'warn'); return false; }
+      try {
+        await api.enqueueFingerprint({ model, api: apiSel.value });
+        toast('已提交指纹测试任务，请到「指纹测试」页或「后台任务管理」看结果', 'ok', 6000);
+      } catch (e) { toast(e.message, 'err', 6000); return false; }
+    },
+  });
 }
 
 function sourceBadge(kind, aliasedFrom, m) {

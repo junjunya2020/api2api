@@ -243,6 +243,8 @@ export function publicModelList() {
       id: modelId,
       kind: 'upstream',
       channels: keptIdx.map((i) => entry.channels[i]),
+      /** ⭐ UI 用：原始渠道名 + 该渠道上的原始上游模型名（拉黑/测试要按这个来） */
+      targets: keptIdx.map((i) => ({ channel: entry.channelNames[i], upstream: modelId })),
       aliasedFrom: null,
     });
   }
@@ -253,15 +255,18 @@ export function publicModelList() {
     const channels = a.channel_name
       ? [a.channel_display || a.channel_name]
       : [...catalog.get(a.upstream_name)?.channels ?? []];
+    const targets = targetsForAlias(a, catalog, banned);
     if (out.has(a.public_name)) {
       const e = out.get(a.public_name);
       e.channels = [...new Set([...e.channels, ...channels])];
+      e.targets = dedupTargets([...(e.targets || []), ...targets]);
       continue;
     }
     out.set(a.public_name, {
       id: a.public_name,
       kind: a.channel_name ? 'alias' : 'alias-global',
       channels: channels.length ? channels : ['所有渠道'],
+      targets,
       aliasedFrom: a.upstream_name,
     });
   }
@@ -276,18 +281,24 @@ export function publicModelList() {
     const members = new Set([canonical, ...aliasNames]);
 
     const chans = [];
+    const targets = [];
     const addChan = (name) => { if (name && !chans.includes(name)) chans.push(name); };
+    const addTarget = (chName, upstream) => {
+      if (banned.has(`${chName}|${upstream}`)) return;
+      addChan(chName);
+      if (!targets.some((t) => t.channel === chName && t.upstream === upstream)) {
+        targets.push({ channel: chName, upstream });
+      }
+    };
     for (const [modelId, entry] of catalog) {
       if (!members.has(modelId)) continue;
       for (let i = 0; i < entry.channelNames.length; i++) {
-        if (banned.has(`${entry.channelNames[i]}|${modelId}`)) continue;
-        addChan(entry.channels[i]);
+        addTarget(entry.channelNames[i], modelId);
       }
     }
     for (const a of aliases) {
       if (!members.has(a.public_name) || !a.channel_name) continue;
-      if (banned.has(`${a.channel_name}|${a.upstream_name}`)) continue;
-      addChan(a.channel_display || a.channel_name);
+      addTarget(a.channel_name, a.upstream_name);
     }
 
     if (out.has(canonical)) {
@@ -296,6 +307,7 @@ export function publicModelList() {
       e.kind = 'synonym';
       e.aliases = aliasNames;
       e.channels = [...new Set([...e.channels, ...chans])];
+      e.targets = dedupTargets([...(e.targets || []), ...targets]);
       e.aliasedFrom = aliasNames[0] ?? e.aliasedFrom;
       continue;
     }
@@ -303,6 +315,7 @@ export function publicModelList() {
       id: canonical,
       kind: 'synonym',
       channels: chans,
+      targets,
       aliasedFrom: aliasNames[0] ?? null,
       /** 额外的非标准字段：这名字归并了哪些别名（便于 UI 说明） */
       aliases: aliasNames,
@@ -310,6 +323,36 @@ export function publicModelList() {
   }
 
   return [...out.values()].sort((x, y) => x.id.localeCompare(y.id));
+}
+
+/** 去重 (channel, upstream) 目标对 */
+function dedupTargets(list) {
+  const seen = new Set();
+  const out = [];
+  for (const t of list) {
+    const k = `${t.channel}|${t.upstream}`;
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push(t);
+  }
+  return out;
+}
+
+/**
+ * 某个映射对应的 (原始渠道名, 原始上游模型名) 目标。
+ * · 渠道专属映射 → 就一条（该渠道 + 它映射到的上游名）
+ * · 全局映射     → 所有**目录里确实有该上游名**的启用渠道
+ */
+function targetsForAlias(a, catalog, banned) {
+  if (a.channel_name) {
+    if (banned.has(`${a.channel_name}|${a.upstream_name}`)) return [];
+    return [{ channel: a.channel_name, upstream: a.upstream_name }];
+  }
+  const entry = catalog.get(a.upstream_name);
+  if (!entry) return [];
+  return entry.channelNames
+    .map((chName, i) => ({ channel: chName, upstream: a.upstream_name }))
+    .filter((t) => !banned.has(`${t.channel}|${t.upstream}`));
 }
 
 /**

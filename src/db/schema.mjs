@@ -227,6 +227,38 @@ CREATE TABLE IF NOT EXISTS request_log (
 CREATE INDEX IF NOT EXISTS idx_rl_ts ON request_log(ts);
 CREATE INDEX IF NOT EXISTS idx_rl_model ON request_log(model, ts);
 
+-- ⭐ 后台任务（用户 2026-10-08：可用性测试 / 指纹测试都在后台跑，
+--    前台实时看进度，关浏览器不中断）。
+--
+-- 两类任务：
+--   · probe      —— 测模型可用性（把一个 (渠道,模型) 在该渠道的**所有 Key** 上打一遍，
+--                    每个 Key 超时默认 10s，可设置）。结果可用于自动拉黑。
+--   · fingerprint—— 测模型指纹（调 vendor/lm-detector 的 fpd CLI）。
+--
+-- spec / result 都用 JSON 文本存 —— 任务类型会继续加，不值得为每种建列。
+CREATE TABLE IF NOT EXISTS job (
+  id          TEXT PRIMARY KEY,
+  kind        TEXT NOT NULL,               -- probe | fingerprint
+  title       TEXT,
+  spec        TEXT NOT NULL,               -- JSON：任务参数
+  status      TEXT NOT NULL DEFAULT 'queued', -- queued|running|done|failed|cancelled
+  total       INTEGER NOT NULL DEFAULT 0,
+  done        INTEGER NOT NULL DEFAULT 0,
+  ok_count    INTEGER NOT NULL DEFAULT 0,
+  fail_count  INTEGER NOT NULL DEFAULT 0,
+  -- {"steps":[{"label":..,"state":"pending|running|ok|fail|skip","detail":..,
+  --            "ms":..,"at":..}]}   —— 前端按它渲染实时进度
+  progress    TEXT NOT NULL DEFAULT '{"steps":[]}',
+  -- 最终结果（指纹排名 / 可用性矩阵 / 自动拉黑清单）
+  result      TEXT,
+  error       TEXT,
+  created_at  INTEGER NOT NULL,
+  started_at  INTEGER,
+  finished_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_job_created ON job(created_at);
+CREATE INDEX IF NOT EXISTS idx_job_status ON job(status);
+
 -- 元信息
 CREATE TABLE IF NOT EXISTS meta (
   k TEXT PRIMARY KEY,

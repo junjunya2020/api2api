@@ -104,6 +104,27 @@ export const api = {
   addSynonym: (payload) => request('POST', '/api/synonyms', payload),
   deleteSynonym: (name) => request('DELETE', `/api/synonyms/${encodeURIComponent(name)}`),
 
+  // ⭐ 后台任务（可用性测试 / 指纹测试）
+  jobs: ({ kind, status, limit } = {}) => {
+    const q = new URLSearchParams();
+    if (kind) q.set('kind', kind);
+    if (status) q.set('status', status);
+    if (limit) q.set('limit', limit);
+    const s = q.toString();
+    return request('GET', `/api/jobs${s ? `?${s}` : ''}`);
+  },
+  job: (id) => request('GET', `/api/jobs/${encodeURIComponent(id)}`),
+  cancelJob: (id) => request('POST', `/api/jobs/${encodeURIComponent(id)}/cancel`, {}),
+  deleteJob: (id) => request('DELETE', `/api/jobs/${encodeURIComponent(id)}`),
+
+  /** 建「测模型可用性」后台任务 */
+  enqueueProbe: (payload) => request('POST', '/api/jobs/probe', payload),
+  /** 建「测模型指纹」后台任务 */
+  enqueueFingerprint: (payload) => request('POST', '/api/jobs/fingerprint', payload),
+  /** 同步版可用性测试（当场返回结果） */
+  probeModel: (payload) => request('POST', '/api/probe/model', payload),
+  detectorStatus: () => request('GET', '/api/detector/status'),
+
   // ⭐ 模型健康度（正常 / 降级 / 不可用）
   modelHealth: ({ channel, state } = {}) => {
     const q = new URLSearchParams();

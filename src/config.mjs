@@ -52,6 +52,26 @@ export const config = {
   adminTokenFile: path.resolve(ROOT, pick('ADMIN_TOKEN_FILE', path.join(DATA_DIR, 'admin_token'))),
   webDir: path.resolve(ROOT, 'web'),
 
+  /**
+   * ⭐ lm-detector（模型指纹检测）仓库位置 —— git 子模块 `vendor/lm-detector`。
+   * 用户 2026-10-08 要求「测试模型指纹就用这个」。
+   */
+  detectorDir: path.resolve(ROOT, pick('DETECTOR_DIR', 'vendor/lm-detector')),
+
+  /**
+   * ⭐ 测模型可用性时，**每个 Key** 等首字的默认超时（毫秒）。
+   * 用户要求「超时 默认10秒可以设置」—— 可在测活请求里按次覆盖。
+   */
+  probeModelTimeoutMs: int('PROBE_MODEL_TIMEOUT_MS', 10_000),
+
+  /**
+   * ⭐ 可用性测试的**自动拉黑阈值**：一个 (渠道,模型) 在该渠道"常规"打完后，
+   * 若**全部 Key 都失败且从未成功**，自动加入黑名单（用户要求
+   * 「从来没成功过、每次调用都失败 → 不在模型列表出现」）。
+   * 置 0 表示不做自动拉黑。
+   */
+  probeAutoBan: int('PROBE_AUTO_BAN', 1),
+
   /** 主密钥：env MASTER_KEY 优先；否则从文件读；都没有则自动生成落盘 */
   masterKey: process.env.MASTER_KEY || '',
 

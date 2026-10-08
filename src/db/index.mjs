@@ -9,6 +9,7 @@ import config, { ensureDirs } from '../config.mjs';
 import { DDL, BUILTIN_CHANNELS } from './schema.mjs';
 import { syncBuiltinBans } from './channel-ban.mjs';
 import { BUILTIN_BANS } from './builtin-bans.mjs';
+import { failOrphanJobs } from './jobs.mjs';
 import { uuid } from '../util/crypto.mjs';
 import log from '../util/log.mjs';
 
@@ -26,7 +27,21 @@ export function getDb() {
   ensureIndexes();
   seedBuiltins();
   seedBlacklist();
+  orphanJobs();
   return db;
+}
+
+/**
+ * 启动时把"卡在 queued/running 的历史后台任务"标成失败 ——
+ * 进程重启后它们其实已经死了，不能让前端以为"还在跑"。
+ */
+function orphanJobs() {
+  try {
+    const n = failOrphanJobs();
+    if (n) log.info(`[db] 后台任务：${n} 个中断的任务已标记失败`);
+  } catch (e) {
+    log.warn(`[db] 处理中断任务失败（不影响运行）: ${e.message}`);
+  }
 }
 
 /**

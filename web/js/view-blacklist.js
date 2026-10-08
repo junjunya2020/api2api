@@ -169,12 +169,69 @@ function renderList(_ignored, errorText) {
       el('td', { class: 'muted', text: `${b.failCount ?? 0} / ${b.okCount ?? 0}` }),
       el('td', { style: 'max-width:440px;font-size:12px;line-height:1.5', text: b.reason || '—' }),
       el('td', { class: 'col-actions' }, [
+        el('button', { class: 'btn btn-sm', type: 'button', text: '测试可用性', onclick: () => testAvailability(b) }),
+        document.createTextNode(' '),
+        el('button', { class: 'btn btn-sm', type: 'button', text: '测试指纹', onclick: () => testFingerprint(b) }),
+        document.createTextNode(' '),
         el('button', { class: 'btn btn-sm', type: 'button', text: '解禁', onclick: () => unban(b) }),
       ]),
     ]))),
   ]);
 
   host.replaceChildren(el('div', { class: 'table-wrap' }, [table]));
+}
+
+/** 测可用性（黑名单条目）—— 默认后台跑，顺带会按结果决定是否重新拉黑 */
+function testAvailability(b) {
+  const toIn = el('input', { class: 'input', type: 'number', value: '10', min: '3' });
+  const bgIn = el('input', { class: 'input', type: 'checkbox', checked: true });
+  const bgWrap = el('label', { style: 'display:flex;align-items:center;gap:8px;font-size:13px' }, [
+    bgIn, el('span', { text: '放到后台跑（可在「后台任务管理」看进度）' }),
+  ]);
+  openModal({
+    title: `测试可用性：${b.channel} / ${b.model}`,
+    bodyNode: [
+      el('p', { class: 'muted', style: 'font-size:12.5px', text: '会把这个 (渠道, 模型) 在该渠道的所有 Key 上各打一次。' }),
+      field('每个 Key 超时（秒）', toIn, '默认 10 秒'),
+      bgWrap,
+    ],
+    okText: '开始',
+    onOk: async () => {
+      const timeoutMs = Math.max(3, Number(toIn.value) || 10) * 1000;
+      if (bgIn.checked) {
+        await api.enqueueProbe({ channel: b.channel, model: b.model, timeoutMs });
+        toast('已提交后台任务（可在「后台任务管理」查看）', 'ok', 5000);
+      } else {
+        toast('正在测试，请稍候…', 'info', 2500);
+        const r = await api.probeModel({ channel: b.channel, model: b.model, timeoutMs, autoBan: false });
+        toast(r.allFailed ? `全部 ${r.total} 个 Key 失败` : `${r.okCount}/${r.total} 个 Key 成功`, r.allFailed ? 'warn' : 'ok', 6000);
+        await loadBlacklist();
+      }
+    },
+  });
+}
+
+/** 测指纹（黑名单条目）—— 只测，不解禁；结果反过来判断该不该解禁 */
+function testFingerprint(b) {
+  const apiSel = el('select', { class: 'input' }, [
+    el('option', { value: 'cc', text: 'Chat Completions' }),
+    el('option', { value: 'responses', text: 'Responses' }),
+    el('option', { value: 'message', text: 'Anthropic Messages' }),
+  ]);
+  openModal({
+    title: `测试模型指纹：${b.model}`,
+    bodyNode: [
+      el('p', { class: 'muted', style: 'font-size:12.5px', text: '用 lm-detector 让模型写随机数，识别它背后到底是不是这个名字对应的模型。' }),
+      field('协议', apiSel, '多数渠道用 Chat Completions'),
+    ],
+    okText: '后台测试',
+    onOk: async () => {
+      try {
+        await api.enqueueFingerprint({ model: b.model, api: apiSel.value });
+        toast('已提交指纹测试任务，请到「指纹测试」页看结果', 'ok', 6000);
+      } catch (e) { toast(e.message, 'err', 6000); return false; }
+    },
+  });
 }
 
 async function unban(b) {

@@ -1,0 +1,4 @@
+[submodule "vendor/lm-detector"]
+	path = vendor/lm-detector
+	url = https://github.com/Ikaleio/lm-detector.git
+	branch = main

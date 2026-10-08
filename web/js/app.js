@@ -11,6 +11,8 @@ import probeView from './view-probe.js';
 import statsView from './view-stats.js';
 import blacklistView from './view-blacklist.js';
 import settingsView from './view-settings.js';
+import jobsPage from './view-jobs-page.js';
+import fingerprintView from './view-fingerprint.js';
 
 /** 视图注册表：名称 → 加载函数 */
 const views = {
@@ -45,6 +47,12 @@ const views = {
   },
   blacklist: async () => {
     await blacklistView.loadBlacklist();
+  },
+  jobs: async () => {
+    await jobsPage.loadJobs();
+  },
+  fingerprint: async () => {
+    await fingerprintView.loadFingerprint();
   },
   settings: async () => {
     await settingsView.loadSettings();
@@ -123,9 +131,17 @@ function initTabs() {
   }
 }
 
+// 从后台标签页切回来时，立即重拉当前视图（轮询在后台会被浏览器降频甚至冻结）
+function bindVisibility() {
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && !loading) switchView(currentView);
+  });
+}
+
 function main() {
   initModal();
   initTabs();
+  bindVisibility();
   keysView.initKeysView();
   aliasesView.initAliasesView();
   channelsView.initChannelsView();
@@ -133,6 +149,8 @@ function main() {
   statsView.initStatsView();
   blacklistView.initBlacklistView();
   settingsView.initSettingsView();
+  jobsPage.initJobsView();
+  fingerprintView.initFingerprintView();
 
   $('#btnRefresh').addEventListener('click', refresh);
 
