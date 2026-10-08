@@ -93,6 +93,7 @@
             <button id="btnAddAlias" class="btn" type="button">+ 新建映射</button>
           </div>
         </div>
+        <div class="panel-body" id="modelModeBar" style="display:flex;align-items:center;flex-wrap:wrap;gap:4px"></div>
         <div class="table-wrap">
           <table class="table">
             <thead>
@@ -390,7 +391,7 @@
         </div>
         <div class="table-wrap">
           <table class="table">
-            <thead><tr><th>名称</th><th>指纹</th><th>状态</th><th>创建时间</th><th>最后使用</th><th class="col-actions">操作</th></tr></thead>
+            <thead><tr><th>名称</th><th>指纹</th><th>渠道</th><th>状态</th><th>最后使用</th><th class="col-actions">操作</th></tr></thead>
             <tbody id="tokenTbody"></tbody>
           </table>
         </div>
@@ -495,6 +496,12 @@
         <div class="panel-head"><h3>发起测试</h3><span class="muted" id="detectorStatus" style="font-size:12px"></span></div>
         <div class="panel-body">
           <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;align-items:end">
+            <label class="field" style="margin:0">
+              <span class="field-label">渠道</span>
+              <select id="fpChannel" class="input">
+                <option value="" selected>全部渠道（默认）</option>
+              </select>
+            </label>
             <label class="field" style="margin:0">
               <span class="field-label">模型名（网关对外名即可）</span>
               <input id="fpModel" class="input" placeholder="例如 deepseek-v4-flash" autocomplete="off" list="fpModelHints">

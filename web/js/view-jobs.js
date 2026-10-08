@@ -49,7 +49,7 @@ export function initJobsPanel({ hostId, kind = null, onJobClick = null }) {
 export function renderJobsInto(host, jobs, { onJobClick } = {}) {
   if (!host) return;
   if (!jobs.length) {
-    host.replaceChildren(el('div', { class: 'muted', style: 'font-size:12.5px', text: '暂无后台任务。' }));
+    host.replaceChildren(el('div', { class: 'muted', style: 'font-size:12.5px', text: '暂无任务。' }));
     return;
   }
   const table = el('table', { class: 'table' }, [
@@ -203,13 +203,13 @@ export function openJobModal({ title, jobId, onClose = null }) {
   const hint = el('div', {
     class: 'field-hint',
     style: 'margin-top:12px',
-    text: '关闭这个窗口不影响测试 —— 任务在后台继续跑，可随时到「后台任务管理」查看。',
+    text: '关闭这个窗口不影响测试 —— 任务继续在服务端跑，可随时到「任务管理」查看。',
   });
   const p = openModal({
     title,
     bodyNode: [host, hint],
-    okText: '后台运行',
-    cancelText: '收起',
+    okText: '收起',
+    cancelText: '关闭',
     onOk: () => { /* 只是收起 */ },
   });
   watchJob(jobId, host);

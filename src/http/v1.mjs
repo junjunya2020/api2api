@@ -13,8 +13,8 @@
  * 只在转发时替换 body.model，其余字节级原样通过。
  */
 import { relay, readBody, pipeResponse, passJson } from '../relay.mjs';
-import { verifyToken } from '../db/tokens.mjs';
-import { publicModelList } from '../db/aliases.mjs';
+import { tokenScope } from '../db/tokens.mjs';
+import { publicModelList, scopedModelList } from '../db/aliases.mjs';
 import { logRequest } from '../db/logs.mjs';
 import { ErrClass, ApiError } from '../util/errors.mjs';
 import { sendJson, sendError, extractToken, handleThrown } from './util.mjs';
@@ -35,14 +35,19 @@ export async function handleV1(req, res, url) {
   const { pathname } = url;
   const token = extractToken(req);
 
-  if (!verifyToken(token)) {
+  // ⭐ token 可以绑定到某个渠道（用户 2026-10-08）：
+  //   绑定后**只用该渠道的 Key**，用于"测这个渠道的真实能力"。
+  //   scopeChannel=null 表示全部渠道（原有行为）。
+  const scope = tokenScope(token);
+  if (!scope) {
     return sendError(res, 401, 'api2api token 无效或缺失', {
       code: 'invalid_api_key', type: 'authentication_error',
     });
   }
+  const scopeChannel = scope.scopeChannel;
 
   if (pathname === '/v1/models' && req.method === 'GET') {
-    const models = publicModelList();
+    const models = scopedModelList(scopeChannel);
     return sendJson(res, 200, {
       object: 'list',
       data: models.map((m) => ({
@@ -61,14 +66,14 @@ export async function handleV1(req, res, url) {
   // 所有 POST 透传端点共用同一条路径
   if (req.method === 'POST' && pathname.startsWith('/v1/')) {
     const tail = pathname.slice(4).replace(/^\/+/, '');
-    if (PASSTHROUGH.has(tail)) return handleRelay(req, res, tail);
+    if (PASSTHROUGH.has(tail)) return handleRelay(req, res, tail, scopeChannel);
   }
 
   return sendError(res, 404, `未知的 /v1 端点: ${pathname}`, { type: 'invalid_request_error' });
 }
 
 /** 通用转发：chat / images / messages / embeddings 共用 */
-async function handleRelay(req, res, pathTail) {
+async function handleRelay(req, res, pathTail, scopeChannel = null) {
   const raw = await readBody(req);
   let body;
   try {
@@ -86,7 +91,7 @@ async function handleRelay(req, res, pathTail) {
   const t0 = Date.now();
 
   try {
-    const { response, meta } = await relay({ publicModel, rawBody: raw, pathTail });
+    const { response, meta } = await relay({ publicModel, rawBody: raw, pathTail, scopeChannel });
 
     // ✅ 首个成功 → 立即返回（流式不缓冲）
     if (wantStream) {

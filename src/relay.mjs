@@ -13,7 +13,7 @@
  */
 import { Readable } from 'node:stream';
 import { getAdapter } from './adapters/index.mjs';
-import { resolveCandidates } from './db/aliases.mjs';
+import { resolveCandidates, scopedCandidates } from './db/aliases.mjs';
 import { getKeySecret, availableKeyCount, enabledKeyCount } from './db/keys.mjs';
 import {
   pickKey, applyFailure, applySuccess,
@@ -50,10 +50,15 @@ export async function readBody(req, limit = config.maxBodyBytes) {
  * @param {(env)=>void} p.onStream 可选：流式已建立时的回调
  * @returns {Promise<{response:Response, meta:object}>} 首个成功的上游响应
  */
-export async function relay({ publicModel, rawBody, pathTail = 'chat/completions', tried = new Set() }) {
-  const candidates = resolveCandidates(publicModel);
+export async function relay({ publicModel, rawBody, pathTail = 'chat/completions', tried = new Set(), scopeChannel = null }) {
+  // ⭐ 渠道作用域 token（用户 2026-10-08）：**只走该渠道的 Key**。
+  //   用于"测某个渠道的真实能力" —— 例如渠道内模型名与别家重名时，
+  //   普通聚合 token 会优先路由到别家，导致测不到目标渠道。
+  const candidates = scopeChannel ? scopedCandidates(publicModel, scopeChannel) : resolveCandidates(publicModel);
   if (!candidates.length) {
-    throw new ApiError(404, `没有可用的渠道来服务模型 "${publicModel}"`, {
+    throw new ApiError(404, scopeChannel
+      ? `渠道 "${scopeChannel}" 没有可用于模型 "${publicModel}" 的配置`
+      : `没有可用的渠道来服务模型 "${publicModel}"`, {
       code: 'model_not_found', type: 'invalid_request_error', errClass: ErrClass.CONFIG_FAULT,
     });
   }

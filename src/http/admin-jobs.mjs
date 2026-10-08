@@ -19,17 +19,20 @@ import * as fp from '../jobs/fingerprint.mjs';
 import { probeModelAvailability } from '../jobs/probe.mjs';
 import { getChannel } from '../db/channels.mjs';
 import { listChannelModels } from '../db/catalog.mjs';
-import { resolveCandidates } from '../db/aliases.mjs';
+import { resolveCandidates, scopedCandidates } from '../db/aliases.mjs';
 import { readJson, sendJson, matchPath, HttpError } from './util.mjs';
 
 /**
  * 给定一个（对外）模型名，展开成"提供它的所有 (渠道, 原始上游模型名)"目标。
  * 走 resolveCandidates —— 它已经处理了归并/映射/同名直通。
+ *
+ * ⭐ 传 channelName 时**限定在该渠道内**（用户 2026-10-08）——
+ *    「按渠道」模式下，测试/拉黑都只针对那一个渠道，不牵连别家。
  */
-function targetsForModel(publicName) {
+function targetsForModel(publicName, channelName = null) {
   const seen = new Set();
   const out = [];
-  const all = resolveCandidates(publicName);
+  const all = channelName ? scopedCandidates(publicName, channelName) : resolveCandidates(publicName);
   for (const c of all) {
     const key = `${c.channelName}|${c.upstreamName}`;
     if (seen.has(key)) continue;
@@ -82,8 +85,9 @@ export async function handleJobs(req, res, url) {
     } else if (body?.channel && body?.model) {
       targets = [{ channel: body.channel, model: String(body.model).trim() }];
     } else if (body?.model) {
-      // 只给了模型名 → 自动展开成"提供它的所有渠道目标"
-      targets = targetsForModel(String(body.model).trim());
+      // 只给了模型名 → 自动展开成"提供它的所有渠道目标"；
+      // 若同时给了 channel，则**只展开该渠道**（用户 2026-10-08：按渠道时只测/只拉黑该渠道）
+      targets = targetsForModel(String(body.model).trim(), body.channel || null);
     }
     if (!targets.length) throw new HttpError(400, '需要 targets / channel+model / model');
     for (const t of targets) {
@@ -113,14 +117,17 @@ export async function handleJobs(req, res, url) {
     const body = await readJson(req);
     const model = String(body?.model ?? '').trim();
     if (!model) throw new HttpError(400, '需要 model');
+    const channel = body?.channel ? String(body.channel) : null;
+    if (channel && !getChannel(channel)) throw new HttpError(404, `渠道不存在: ${channel}`);
     if (!fp.detectorReady()) {
       throw new HttpError(503, `指纹检测器（lm-detector）未就绪：${fp.detectorDir()}/cli/fpd.ts 不存在`);
     }
     const job = enqueueJob({
       kind: JobKind.FINGERPRINT,
-      title: `测指纹：${model}`,
+      title: `测指纹：${channel ? `[${channel}] ` : ''}${model}`,
       spec: {
         model,
+        channel,
         api: body?.api || 'cc',
         repeat: body?.repeat ?? 1,
         timeoutSec: body?.timeoutSec ?? 120,

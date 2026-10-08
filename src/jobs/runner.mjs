@@ -196,9 +196,10 @@ async function runFingerprintJob(job, isCancelled) {
   const spec = job.spec || {};
   const model = String(spec.model || '').trim();
   if (!model) throw new Error('spec.model 必填');
+  const chLabel = spec.channel ? `[${spec.channel}] ` : '';
 
   const steps = [
-    { label: `指纹请求：${model}`, state: 'running' },
+    { label: `指纹请求：${chLabel}${model}`, state: 'running' },
   ];
   const writer = jobsDb.makeProgressWriter(job.id, { initialTotal: 1 });
   writer.setTotal(1);
@@ -207,13 +208,14 @@ async function runFingerprintJob(job, isCancelled) {
   const started = Date.now();
   const res = await fp.fingerprintModel({
     model,
+    channel: spec.channel || null,
     api: spec.api || 'cc',
     repeat: Math.min(Math.max(Number(spec.repeat) || 1, 1), 3),
     timeoutSec: Math.max(5, Number(spec.timeoutSec) || 120),
     cancel: isCancelled,
     onProgress: (p) => {
       steps[0] = {
-        label: `指纹请求：${model}`,
+        label: `指纹请求：${chLabel}${model}`,
         state: 'running',
         detail: p.rounds ? `已收集 ${p.rounds} 轮输出…` : `接收中（${Math.round((p.bytes || 0) / 1024)} KB）`,
       };
@@ -222,7 +224,7 @@ async function runFingerprintJob(job, isCancelled) {
   });
 
   steps[0] = {
-    label: `指纹请求：${model}`,
+    label: `指纹请求：${chLabel}${model}`,
     state: res.ok ? 'ok' : 'fail',
     detail: res.ok
       ? `判定 ${res.prediction?.name || res.prediction?.id}（${fmtPct(res.prediction?.probability)}）`
@@ -238,7 +240,7 @@ async function runFingerprintJob(job, isCancelled) {
     failCount: res.ok ? 0 : 1,
     result: res.ok
       ? {
-        model, format: res.format, prediction: res.prediction,
+        model, channel: spec.channel || null, format: res.format, prediction: res.prediction,
         ranking: res.ranking, rounds: res.rounds, bank: res.bank, ms: res.ms,
       }
       : { model, error: res.error, ms: res.ms },

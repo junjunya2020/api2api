@@ -6,7 +6,7 @@
  *    本页只留「只接快速模型」这一类运行设置。
  */
 import api, { getToken, setToken } from './api.js';
-import { $, el, fmtTime, fmtAgo, toast, openModal, field, confirmDialog } from './ui.js';
+import { $, el, fmtAgo, toast, openModal, field, confirmDialog } from './ui.js';
 
 export async function loadSettings() {
   renderTokenInput();
@@ -161,16 +161,44 @@ function renderTokens(tokens) {
   tbody.replaceChildren(...tokens.map((t) => el('tr', {}, [
     el('td', { text: t.name || '—' }),
     el('td', { class: 'uuid-cell', text: t.hashPrefix + '…' }),
+    // ⭐ 渠道作用域（用户 2026-10-08）：绑定后只用该渠道的 Key
+    el('td', {}, [t.scopeChannel
+      ? el('span', { class: 'pill pill-accent', text: `仅 ${t.scopeDisplay || t.scopeChannel}` })
+      : el('span', { class: 'pill pill-idle', text: '全部渠道' })]),
     el('td', {}, [el('span', { class: t.enabled ? 'pill pill-ok' : 'pill pill-idle', text: t.enabled ? '启用' : '停用' })]),
-    el('td', { class: 'muted', text: fmtTime(t.createdAt) }),
     el('td', { class: 'muted', text: t.lastUsedAt ? fmtAgo(t.lastUsedAt) : '从未使用' }),
     el('td', { class: 'col-actions' }, [
+      el('button', { class: 'btn btn-sm', type: 'button', text: '设渠道', onclick: () => scopeTokenDialog(t) }),
+      document.createTextNode(' '),
       el('button', {
         class: 'btn btn-sm btn-danger', type: 'button', text: '删除',
         onclick: () => removeToken(t),
       }),
     ]),
   ])));
+}
+
+/** ⭐ 改 token 的渠道作用域（用户 2026-10-08） */
+function scopeTokenDialog(t) {
+  const sel = el('select', { class: 'input' }, [el('option', { value: '', text: '全部渠道（默认）' })]);
+  api.channels().then((r) => {
+    for (const c of (r.channels || [])) sel.append(el('option', { value: c.name, text: c.displayName || c.name }));
+    sel.value = t.scopeChannel || '';
+  }).catch(() => {});
+  openModal({
+    title: `设置渠道作用域：${t.name || t.hashPrefix}`,
+    bodyNode: [
+      el('p', { class: 'muted', style: 'font-size:12.5px', text: '绑定某渠道后，这个 token **只用该渠道的 Key**，'
+        + '且 /v1/models 只列出该渠道的模型 —— 用于"测某个渠道的真实能力"。' }),
+      field('渠道', sel, '选择"全部渠道"= 恢复原有聚合行为'),
+    ],
+    okText: '保存',
+    onOk: async () => {
+      await api.setTokenScope(t.name, sel.value || null);
+      toast('已更新', 'ok');
+      await loadSettings();
+    },
+  });
 }
 
 async function removeToken(t) {
@@ -186,17 +214,24 @@ async function removeToken(t) {
 
 function newTokenDialog() {
   const nameIn = el('input', { class: 'input', placeholder: '例如：我的笔记本', autocomplete: 'off' });
+  const scopeSel = el('select', { class: 'input' }, [el('option', { value: '', text: '全部渠道（默认）' })]);
+  api.channels().then((r) => {
+    for (const c of (r.channels || [])) {
+      scopeSel.append(el('option', { value: c.name, text: c.displayName || c.name }));
+    }
+  }).catch(() => {});
   const outBox = el('div');
 
   openModal({
     title: '新建下游 Token',
     bodyNode: [
       field('名称', nameIn, '便于识别用途'),
+      field('渠道作用域', scopeSel, '选某渠道后，这个 token 只用该渠道的 Key（用于测该渠道真实能力）'),
       outBox,
     ],
     okText: '生成',
     onOk: async () => {
-      const res = await api.newToken(nameIn.value.trim() || null);
+      const res = await api.newToken(nameIn.value.trim() || null, scopeSel.value || null);
       outBox.replaceChildren(
         el('div', { class: 'field-hint', style: 'margin-top:8px;color:var(--err);font-weight:500', text: '⚠ 明文只显示这一次，请立即复制保存' }),
         el('pre', { class: 'codeblock', text: res.token }),

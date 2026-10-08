@@ -163,6 +163,24 @@ function migrate() {
     log.error('[db] 迁移 channel_key.grace_until 失败:', e.message);
     throw e;
   }
+
+  // ---- client_token.scope_channel ----
+  // ⭐ 渠道作用域 token（用户 2026-10-08）：
+  //   令牌可以绑定到某个渠道（**只用该渠道的 Key**），用于"测这个渠道真实能力"。
+  //   NULL = 全部渠道（原有行为，存量行自动为 NULL）。
+  try {
+    const ct = cols('client_token');
+    if (!ct.includes('scope_channel')) {
+      db.exec('ALTER TABLE client_token ADD COLUMN scope_channel TEXT');
+      log.info('[db] 迁移：client_token 增加 scope_channel（NULL=全部渠道）');
+    }
+    if (!ct.includes('scope_note')) {
+      db.exec('ALTER TABLE client_token ADD COLUMN scope_note TEXT');
+    }
+  } catch (e) {
+    log.error('[db] 迁移 client_token.scope_channel 失败:', e.message);
+    throw e;
+  }
 }
 
 /** 预置内置渠道：存在则只更新展示性字段，**不覆盖 base_url / adapter**

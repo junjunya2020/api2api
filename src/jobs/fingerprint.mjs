@@ -20,8 +20,7 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import config from '../config.mjs';
 import log from '../util/log.mjs';
-import { getChannel } from '../db/channels.mjs';
-import { fastModelsOnly, setFastModelsOnly } from '../db/settings.mjs';
+import * as tokens from '../db/tokens.mjs';
 
 /** lm-detector 在仓库里的位置（子模块） */
 export function detectorDir() {
@@ -190,35 +189,38 @@ export function summarize(raw) {
 }
 
 /**
- * ⭐ 指纹测试总入口（后台任务用）。
+ * ⭐ 指纹测试总入口（用户 2026-10-08）。
  *
- * 负责：
- *   ① 临时关掉「只接快速模型」（否则很多模型会被 fast-mode 拦截）
- *   ② 用 `/v1` 的 baseUrl + admin token 跑 lm-detector
- *   ③ **无论成功失败都恢复**原开关
+ * 选择渠道的方式（用户原话：「要可以选择渠道名字 默认是全部渠道」）：
+ *   · 不传 channel → 用**全渠道聚合**的 admin token（默认行为）
+ *   · 传了 channel → 临时签发一个**绑定该渠道**的 token，
+ *     这样指纹请求只走该渠道的 Key —— 干净、不影响别的测试、也不用动全局开关。
+ *     （早期实现靠"临时关掉只接快速模型"来绕开 fast-mode 拦截，既脏又会互相打架。）
  *
- * @param {{model:string, api?:string, repeat?:number, timeoutSec?:number,
+ * @param {{model:string, channel?:string|null, api?:string, repeat?:number, timeoutSec?:number,
  *          onProgress?:Function, cancel?:Function}} opts
  */
 export async function fingerprintModel(opts) {
-  const { model, api = 'cc', repeat = 1, timeoutSec = 120, onProgress = null, cancel = null } = opts;
+  const { model, channel = null, api = 'cc', repeat = 1, timeoutSec = 120, onProgress = null, cancel = null } = opts;
   const base = `http://127.0.0.1:${config.port}/v1`;
 
-  // 用管理 token 当 API key（网关自己鉴权；上游真 Key 永不外泄）
-  const apiKey = adminToken();
-
-  // ① 让被 fast-mode 拉黑的模型也能被测到
-  const fastBefore = fastModelsOnly();
-  if (fastBefore) {
-    try { setFastModelsOnly(false); } catch (e) { log.warn(`[fingerprint] 暂关快速模式失败: ${e.message}`); }
+  let apiKey;
+  let tempName = null;
+  if (channel) {
+    // 绑定该渠道的临时 token（明文只在返回值里，用完即删）
+    tempName = `fp-scope-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const created = tokens.createToken(tempName, channel, `指纹测试临时令牌（渠道=${channel}）`);
+    apiKey = created.token;
+  } else {
+    apiKey = adminToken();
   }
 
   try {
     const res = await runFingerprint({ baseUrl: base, apiKey, model, api, repeat, timeoutSec, onProgress, cancel });
     return res;
   } finally {
-    if (fastBefore) {
-      try { setFastModelsOnly(true); } catch (e) { log.warn(`[fingerprint] 恢复快速模式失败: ${e.message}`); }
+    if (tempName) {
+      try { tokens.deleteToken(tempName); } catch (e) { log.warn(`[fingerprint] 清理临时令牌失败: ${e.message}`); }
     }
   }
 }
@@ -230,13 +232,6 @@ export function adminToken() {
   } catch {
     return '';
   }
-}
-
-/** 渠道 → api2api 对外模型名（把上游真名转成网关能看到的名字） */
-export function publicModelNameFor(channelRef, upstreamModel) {
-  const ch = getChannel(channelRef);
-  if (!ch) return upstreamModel;
-  return upstreamModel;
 }
 
 export default {

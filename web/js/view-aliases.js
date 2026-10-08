@@ -1,10 +1,13 @@
 /**
  * 视图：模型。
  *
- * 三块内容，主次分明：
  *   ① 下游可用模型 —— 上游目录 + 映射叠加后，下游 /v1/models 实际能看到的东西
+ *      ⭐ 两种视图（用户 2026-10-08）：
+ *         · 「全部合并」= 不按渠道分，同一模型合并成一行（名字去重）
+ *         · 「按渠道」  = 按渠道分组显示，**只列该渠道的模型**；
+ *                        此模式下"拉黑/测试"都**只作用于该渠道**，不会牵连别家
  *   ② 上游模型目录 —— 各渠道 GET /models 拉回来的原始清单（按渠道分组）
- *   ③ 额外映射     —— 可选的改名层，不影响"有哪些模型"
+ *   ③ 额外映射     —— 可选的改名层
  */
 import api from './api.js';
 import {
@@ -13,28 +16,96 @@ import {
 import { openJobModal } from './view-jobs.js';
 import { getChannels } from './view-keys.js';
 
+const LS_MODE = 'a2a.models.mode';      // 'merged' | 'channel'
+const LS_CH = 'a2a.models.channel';     // 选中的渠道名
+
 const state = {
   aliases: [],
   downstream: [],
   upstreamGroups: [],
   synonyms: [],
+  channels: [],          // [{name, displayName}]
+  mode: localStorage.getItem(LS_MODE) || 'merged',
+  channel: localStorage.getItem(LS_CH) || null,
 };
 
 export async function loadAliases() {
-  const [a, m, u, s] = await Promise.all([
+  const [a, m, u, s, ch] = await Promise.all([
     api.listAliases(),
     api.models(),
     api.upstreamModels ? api.upstreamModels() : Promise.resolve({ groups: [] }),
     api.synonyms ? api.synonyms() : Promise.resolve({ synonyms: [] }),
+    api.channels ? api.channels() : Promise.resolve({ channels: [] }),
   ]);
   state.aliases = a.aliases || [];
   state.downstream = m.models || [];
   state.upstreamGroups = u.groups || [];
   state.synonyms = s.synonyms || [];
+  state.channels = (ch.channels || []).map((c) => ({ name: c.name, displayName: c.displayName || c.name }));
+  if (!state.channel || !state.channels.some((c) => c.name === state.channel)) {
+    state.channel = state.channels[0]?.name || null;
+  }
+  renderModeBar();
   render();
   renderCatalog();
   renderAliases();
   renderSynonyms();
+}
+
+/* ---------------- 视图模式：全部合并 / 按渠道 ---------------- */
+
+function renderModeBar() {
+  const host = $('#modelModeBar');
+  if (!host) return;
+  const mk = (mode, label) => el('button', {
+    class: 'btn btn-sm' + (state.mode === mode ? ' btn-primary' : ''),
+    type: 'button', text: label,
+    onclick: () => { state.mode = mode; localStorage.setItem(LS_MODE, mode); renderModeBar(); render(); },
+  });
+  const sel = el('select', { class: 'input input-sm' }, state.channels.map((c) => el('option', {
+    value: c.name, text: c.displayName, selected: c.name === state.channel,
+  })));
+  sel.value = state.channel || '';
+  sel.addEventListener('change', () => {
+    state.channel = sel.value; localStorage.setItem(LS_CH, sel.value); render();
+  });
+
+  host.replaceChildren(
+    el('span', { class: 'muted', style: 'font-size:12px;margin-right:6px', text: '视图：' }),
+    mk('merged', '全部合并'),
+    document.createTextNode(' '),
+    mk('channel', '按渠道'),
+    state.mode === 'channel'
+      ? el('span', { style: 'margin-left:10px;display:inline-flex;align-items:center;gap:6px' }, [sel])
+      : el('span'),
+    state.mode === 'channel'
+      ? el('span', { class: 'muted', style: 'font-size:12px;margin-left:10px', text: '只列该渠道的模型；拉黑/测试也只作用于该渠道' })
+      : el('span', { class: 'muted', style: 'font-size:12px;margin-left:10px', text: '同名模型合并成一行' }),
+  );
+}
+
+/** 当前视图下要显示的行（按渠道时只留该渠道的模型，并把 targets 收敛到该渠道） */
+function visibleModels() {
+  if (state.mode !== 'channel' || !state.channel) return state.downstream;
+  const ch = state.channels.find((c) => c.name === state.channel);
+  const disp = ch?.displayName || state.channel;
+  const hit = (c) => c === disp || c === state.channel;
+  const out = [];
+  for (const m of state.downstream) {
+    const channels = (m.channels || []).filter(hit);
+    const targets = (m.targets || []).filter((t) => hit(t.channel));
+    if (!channels.length && !targets.length) continue;
+    out.push({ ...m, channels: channels.length ? channels : [disp], targets });
+  }
+  return out;
+}
+
+/** 当前视图的模型行对应的 (渠道, 上游模型名) 目标 */
+function rowTargets(m) {
+  if (state.mode === 'channel' && state.channel) {
+    return (m.targets || []).filter((t) => t.channel === state.channel);
+  }
+  return m.targets || [];
 }
 
 /* ---------------- ① 下游可用模型 ---------------- */
@@ -43,11 +114,15 @@ function render() {
   const tbody = $('#downstreamTbody');
   const empty = $('#downstreamEmpty');
   if (!tbody) return;
-  const rows = state.downstream;
+  const rows = visibleModels();
 
   if (!rows.length) {
     tbody.replaceChildren();
-    if (empty) empty.hidden = false;
+    if (empty) {
+      empty.hidden = false;
+      empty.textContent = state.mode === 'channel'
+        ? '该渠道暂无模型。' : '暂无模型（先去「上游模型目录」拉取）。';
+    }
     return;
   }
   if (empty) empty.hidden = true;
@@ -67,14 +142,14 @@ function render() {
       // ⭐ 左键 = 立刻开始测（弹实时进度框）；右键 = 设置超时
       el('button', {
         class: 'btn btn-sm', type: 'button', text: '测试可用性', title: '左键：立即测试（实时进度）；右键：设置超时',
-        onclick: (e) => testAvailability(m, e),
-        oncontextmenu: (e) => openTimeoutMenu(e, m, 'probe'),
+        onclick: () => testAvailability(m),
+        oncontextmenu: (e) => openTimeoutMenu(e, 'probe'),
       }),
       document.createTextNode(' '),
       el('button', {
         class: 'btn btn-sm', type: 'button', text: '测试指纹', title: '左键：立即测试；右键：设置超时',
-        onclick: (e) => testFingerprint(m, e),
-        oncontextmenu: (e) => openTimeoutMenu(e, m, 'fingerprint'),
+        onclick: () => testFingerprint(m),
+        oncontextmenu: (e) => openTimeoutMenu(e, 'fingerprint'),
       }),
     ]),
   ])));
@@ -82,9 +157,9 @@ function render() {
 
 /* ---------------- 行操作：拉黑 / 测可用性 / 测指纹 ---------------- */
 
-/** 该模型可用的 (原始渠道, 原始上游模型名) 目标 */
+/** 当前视图下该行对应的 (原始渠道, 原始上游模型名) 目标 */
 function targetsOf(m) {
-  return (m.targets || []).filter((t) => t && t.channel && t.upstream);
+  return rowTargets(m).filter((t) => t && t.channel && t.upstream);
 }
 
 /** 当前生效的超时（秒）。右键可改，存 localStorage，按"操作类型"记。 */
@@ -115,11 +190,13 @@ function chooseTarget(m, { title, intro }, onPick) {
 function testAvailability(m) {
   const targets = targetsOf(m);
   if (!targets.length) { toast('没有可测试的渠道目标', 'warn'); return; }
-  // 单目标 → 直接测该目标；多目标 → 传模型名，后端自动展开成"所有渠道一起测"
-  const spec = targets.length === 1
-    ? { channel: targets[0].channel, model: targets[0].upstream }
-    : { model: m.id };
-  startProbeJob(spec, m.id);
+  // ⭐「按渠道」模式下**只测当前渠道**（用户 2026-10-08：不然会牵连别家）
+  const spec = (state.mode === 'channel' && state.channel)
+    ? { channel: state.channel, model: m.id }
+    : (targets.length === 1
+      ? { channel: targets[0].channel, model: targets[0].upstream }
+      : { model: m.id });   // 全部渠道 → 后端展开成所有渠道
+  startProbeJob(spec, spec.channel ? `${m.id} @${spec.channel}` : m.id);
 }
 
 async function startProbeJob(spec, label) {
@@ -140,20 +217,22 @@ async function startProbeJob(spec, label) {
 }
 
 function testFingerprint(m) {
-  startFingerprintJob(m.id);
+  // ⭐「按渠道」模式下指纹也**只走该渠道**（用户 2026-10-08）
+  const channel = (state.mode === 'channel' && state.channel) ? state.channel : null;
+  startFingerprintJob(m.id, 'cc', channel);
 }
 
-async function startFingerprintJob(model, api = 'cc') {
+async function startFingerprintJob(model, api = 'cc', channel = null) {
   let jr;
   try {
-    jr = await api.enqueueFingerprint({ model, api, timeoutSec: timeoutSec('fingerprint') });
+    jr = await api.enqueueFingerprint({ model, api, channel, timeoutSec: timeoutSec('fingerprint') });
   } catch (e) { toast(e.message, 'err', 6000); return; }
-  openJobModal({ title: `测试指纹：${model}`, jobId: jr.job.id });
+  openJobModal({ title: `测试指纹：${channel ? `[${channel}] ` : ''}${model}`, jobId: jr.job.id });
 }
 
 /* -------- 右键：设置超时 -------- */
 
-function openTimeoutMenu(e, m, kind) {
+function openTimeoutMenu(e, kind) {
   e.preventDefault();
   e.stopPropagation();
   const isFp = kind === 'fingerprint';
@@ -306,7 +385,8 @@ async function fetchChannel(channel) {
 }
 
 async function fetchAll() {
-  const chans = getChannels().filter((c) => c.enabled);
+  // 用本页自己加载的渠道列表（不依赖"Key 管理"页是否访问过）
+  const chans = state.channels.length ? state.channels : getChannels();
   if (!chans.length) { toast('没有启用的渠道', 'warn'); return; }
   let total = 0;
   const failed = [];

@@ -142,8 +142,9 @@ export const api = {
 
   // token
   tokens: () => request('GET', '/api/tokens'),
-  newToken: (name) => request('POST', '/api/tokens', { name }),
+  newToken: (name, scopeChannel = null) => request('POST', '/api/tokens', { name, scopeChannel }),
   deleteToken: (name) => request('DELETE', `/api/tokens/${encodeURIComponent(name)}`),
+  setTokenScope: (name, scopeChannel) => request('PATCH', `/api/tokens/${encodeURIComponent(name)}`, { scopeChannel }),
 };
 
 export { ApiError };

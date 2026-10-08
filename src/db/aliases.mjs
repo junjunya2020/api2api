@@ -339,6 +339,69 @@ function dedupTargets(list) {
 }
 
 /**
+ * ⭐ 按渠道作用域裁剪的对外模型清单（用户 2026-10-08）。
+ *
+ * 语义：一个绑定到渠道 X 的 token，**只应该看到 / 只能调用** X 提供的模型。
+ * 做法：把 publicModelList() 里每条记录的 channels / targets 收敛到 X；
+ *       完全不落在 X 的条目**整条去掉**。
+ *
+ * @param {string|null} channelName  渠道名（internal name）；null/空 = 全部渠道（原样返回）
+ */
+export function scopedModelList(channelName) {
+  const all = publicModelList();
+  if (!channelName) return all;
+  const ch = getChannel(channelName);
+  if (!ch) return [];
+  const display = ch.display_name || ch.name;
+  const hit = (c) => c === display || c === ch.name;
+  const kept = [];
+  for (const m of all) {
+    const targets = (m.targets || []).filter((t) => hit(t.channel));
+    const channels = (m.channels || []).filter(hit);
+    if (!targets.length && !channels.length) continue;
+    kept.push({
+      ...m,
+      // 无 targets 的条目（极少数）退回用 channels 判断的结果
+      targets: targets.length ? targets : (m.targets || []),
+      channels: channels.length ? channels : [display],
+    });
+  }
+  return kept;
+}
+
+/**
+ * ⭐ 按渠道作用域裁剪的**候选**（路由用，用户 2026-10-08）。
+ *
+ * 绑定渠道的 token 调某模型时：
+ *   · 该模型落在这个渠道 → 就用它自己的解析结果（只走该渠道）
+ *   · 该模型**不**落在这个渠道 → **把上游名回退成请求里的原名**，
+ *     这样「渠道内某个模型的名字」也能测（例如只在该渠道有的模型）。
+ *
+ * ⚠️ 关键约束：任何情况下都**不改写有效模型的解析**，避免把已能路由的模型弄坏。
+ */
+export function scopedCandidates(publicName, channelName) {
+  const all = resolveCandidates(publicName);
+  if (!channelName) return all;
+  const ch = getChannel(channelName);
+  if (!ch) return [];
+  const here = all.filter((c) => c.channelId === ch.id);
+  if (here.length) return here;
+  // 该模型不落在这个渠道 → 回退同名直通（只探测该渠道）
+  return [normalize({
+    channel_id: ch.id,
+    channel_name: ch.name,
+    channel_display: ch.display_name,
+    adapter: ch.adapter,
+    base_url: ch.base_url,
+    sort_order: ch.sort_order,
+    upstream_name: publicName,
+    priority: 0,
+    weight: 1,
+    catalogKnown: false,
+  })];
+}
+
+/**
  * 某个映射对应的 (原始渠道名, 原始上游模型名) 目标。
  * · 渠道专属映射 → 就一条（该渠道 + 它映射到的上游名）
  * · 全局映射     → 所有**目录里确实有该上游名**的启用渠道

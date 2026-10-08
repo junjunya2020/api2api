@@ -18,10 +18,34 @@ let autoTimer = null;
 
 export async function loadFingerprint() {
   fillModelHints();
+  fillChannels();
   detectStatus();
   await refreshHistory();
   startAuto();
 }
+
+/** ⭐ 渠道下拉：默认"全部渠道"（用户 2026-10-08） */
+async function fillChannels() {
+  const sel = $('#fpChannel');
+  if (!sel) return;
+  try {
+    const r = await api.channels();
+    const opts = [el('option', { value: '', text: '全部渠道（默认）' })];
+    for (const c of (r.channels || [])) {
+      opts.push(el('option', { value: c.name, text: c.displayName || c.name }));
+    }
+    sel.replaceChildren(...opts);
+    sel.value = localStorage.getItem('a2a.fp.channel') || '';
+    sel.addEventListener('change', () => {
+      localStorage.setItem('a2a.fp.channel', sel.value);
+      refreshHistory();          // 历史列表按渠道过滤
+      fillModelHints();          // 模型候选也换成该渠道的
+    });
+  } catch { /* ignore */ }
+}
+
+/** 当前选中的渠道（'' = 全部） */
+function currentChannel() { return $('#fpChannel')?.value || null; }
 
 async function detectStatus() {
   const host = $('#detectorStatus');
@@ -48,7 +72,11 @@ async function refreshHistory() {
   if (!host) return;
   try {
     const r = await api.jobs({ kind: 'fingerprint', limit: 40 });
-    renderJobsInto(host, r.jobs || [], { onJobClick: showResult });
+    let list = r.jobs || [];
+    // 选了具体渠道 → 只显示该渠道的指纹任务
+    const ch = currentChannel();
+    if (ch) list = list.filter((j) => (j.spec?.channel || null) === ch);
+    renderJobsInto(host, list, { onJobClick: showResult });
   } catch (e) {
     host.replaceChildren(el('div', { class: 'muted', text: `读取历史失败：${e.message}` }));
   }
@@ -73,11 +101,12 @@ async function run() {
   try {
     const r = await api.enqueueFingerprint({
       model,
+      channel: currentChannel(),
       api: $('#fpApi')?.value || 'cc',
       repeat: Number($('#fpRepeat')?.value) || 1,
       timeoutSec: Number($('#fpTimeout')?.value) || 120,
     });
-    toast('已提交后台任务', 'ok');
+    toast('已开始测试', 'ok');
     activeJobId = r.job.id;
     $('#fpActivePanel').hidden = false;
     watchActive(r.job.id);

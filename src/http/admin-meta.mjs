@@ -126,22 +126,31 @@ export async function handleMeta(req, res, url) {
     if (method === 'GET') {
       return sendJson(res, 200, {
         // 只给 hash 前缀，便于区分；明文不可再取
-        tokens: tokens.listTokens().map((t) => ({
-          hashPrefix: t.token_hash.slice(0, 12),
-          name: t.name,
-          enabled: !!t.enabled,
-          createdAt: t.created_at,
-          lastUsedAt: t.last_used_at,
-        })),
+        tokens: tokens.listTokens().map((t) => {
+          const ch = t.scope_channel ? channels.getChannel(t.scope_channel) : null;
+          return {
+            hashPrefix: t.token_hash.slice(0, 12),
+            name: t.name,
+            enabled: !!t.enabled,
+            createdAt: t.created_at,
+            lastUsedAt: t.last_used_at,
+            // ⭐ 渠道作用域：null = 全部渠道
+            scopeChannel: t.scope_channel || null,
+            scopeDisplay: ch ? (ch.display_name || ch.name) : null,
+          };
+        }),
       });
     }
     if (method === 'POST') {
       const body = await readJson(req).catch(() => ({}));
-      const created = tokens.createToken(body?.name ?? null);
+      const scopeChannel = body?.scopeChannel || null;
+      if (scopeChannel && !channels.getChannel(scopeChannel)) throw new HttpError(404, `渠道不存在: ${scopeChannel}`);
+      const created = tokens.createToken(body?.name ?? null, scopeChannel, body?.scopeNote ?? null);
       return sendJson(res, 201, {
         ok: true,
         token: created.token,
         name: created.name,
+        scopeChannel: created.scopeChannel,
         warning: '明文 token 只返回这一次，请立即保存',
       });
     }
@@ -152,6 +161,15 @@ export async function handleMeta(req, res, url) {
     const ok = tokens.deleteToken(pt.name);
     if (!ok) throw new HttpError(404, `token 不存在: ${pt.name}`);
     return sendJson(res, 200, { ok: true, deleted: true });
+  }
+  // ⭐ 改 token 的渠道作用域（用户 2026-10-08）
+  if (pt && method === 'PATCH') {
+    const body = await readJson(req).catch(() => ({}));
+    const scopeChannel = body?.scopeChannel || null;
+    if (scopeChannel && !channels.getChannel(scopeChannel)) throw new HttpError(404, `渠道不存在: ${scopeChannel}`);
+    const ok = tokens.setTokenScope(pt.name, scopeChannel);
+    if (!ok) throw new HttpError(404, `token 不存在: ${pt.name}`);
+    return sendJson(res, 200, { ok: true, scopeChannel });
   }
 
   // ---- 观测 ----
